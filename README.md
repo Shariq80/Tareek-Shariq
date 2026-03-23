@@ -239,7 +239,7 @@ The `data/evaluation/` folder contains ground-truth traffic count data for post-
 
 ## Config Wizard (Web UI)
 
-A web-based wizard for building config files interactively — select counties on a map, configure modes, set scaling factors, and export a ready-to-use `config.json`.
+Instead of editing JSON manually, you can use the Config Wizard to build a config file for any county in the US through an interactive web interface. Select counties on a map, configure modes, set scaling factors, and export a ready-to-use `config.json`.
 
 ```bash
 cd webapp
@@ -247,6 +247,14 @@ python run.py
 ```
 
 Opens at **http://localhost:8000**. See [webapp/README.md](webapp/README.md) for details.
+
+Once the wizard generates your `config.json`, place it in the `config/` directory and run the experiment from the command line:
+
+```bash
+python run_experiment.py --config config/config.json
+```
+
+> **Coming soon:** Running simulations directly from the web app.
 
 ---
 
