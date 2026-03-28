@@ -25,9 +25,9 @@ app = FastAPI(title="Simulation Config Wizard")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["http://localhost:8000", "http://127.0.0.1:8000"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
 )
 
 # Paths
@@ -243,7 +243,7 @@ def assemble_config(form_data: dict) -> dict:
         },
         "chains": _build_chains_config(form_data, defaults),
         "logging": {
-            "level": "DEBUG",
+            "level": "INFO",
             "show_progress_bar": True,
             "log_to_file": True,
             "log_to_console": True,

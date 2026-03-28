@@ -7,7 +7,7 @@
     ]
   },
   "data": {
-    "data_dir": "/home/exouser/Documents/twin-cities-sim/data",
+    "data_dir": "/path/to/your/data",
     "lodes": {
       "year": 2023,
       "job_type": "JT00",
@@ -42,7 +42,7 @@
     "_country_filter_help": "Only consider feeds from this country code when filtering the catalog",
     "api_keys": {
       "_help": "API keys for GTFS feeds that require authentication, keyed by domain. Register free at https://developer.wmata.com/",
-      "wmata.com": "c0b02b2e2f2c42a1af8d288fde0128ef"
+      "wmata.com": "YOUR_WMATA_API_KEY"
     }
   },
   "modes": {

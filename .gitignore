@@ -11,3 +11,12 @@ __pycache__/
 logs/
 experiments/
 cache/
+
+# Secrets and environment
+.env
+.env.*
+*.key
+*.pem
+*.p12
+secrets.json
+credentials.json

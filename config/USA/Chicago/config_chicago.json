@@ -7,7 +7,7 @@
     ]
   },
   "data": {
-    "data_dir": "/home/exouser/Documents/twin-cities-sim/data",
+    "data_dir": "/path/to/your/data",
     "lodes": {
       "year": 2023,
       "job_type": "JT00",
