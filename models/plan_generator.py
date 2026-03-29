@@ -889,10 +889,12 @@ class PlanGenerator(_BasePlanGenerator):
         else:
             self.data_dir = data_dir
 
-        # Reconfigure logger based on log_to_file/log_to_console settings from config
-        log_to_file = self.config.get('logging', {}).get('log_to_file', True)
-        log_to_console = self.config.get('logging', {}).get('log_to_console', True)
-        self._reconfigure_logger(log_to_file, log_to_console)
+        # Reconfigure logger based on log_to_file/log_to_console settings from config.
+        # Skip when driven by ExperimentRunner (experiment_dir provided) — it manages the logger.
+        if experiment_dir is None:
+            log_to_file = self.config.get('logging', {}).get('log_to_file', True)
+            log_to_console = self.config.get('logging', {}).get('log_to_console', True)
+            self._reconfigure_logger(log_to_file, log_to_console)
 
         # Store verbose setting for controlling repetitive log messages
         self.verbose = self.config.get('logging', {}).get('verbose', True)

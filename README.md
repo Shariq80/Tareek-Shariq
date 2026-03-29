@@ -28,35 +28,7 @@ pip install -r requirements.txt
 
 ### 3. Configure
 
-Copy one of the example configs from `config/USA/` and edit it:
-
-```bash
-cp config/USA/TwinCities/config_twin.json config/config_local.json
-```
-
-At minimum, set:
-
-```json
-{
-  "region": {
-    "counties": ["27053", "27123"]
-  },
-  "data": {
-    "data_dir": "data",
-    "surveys": [
-      {
-        "type": "nhts",
-        "year": "2022",
-        "file": "nhts/csv/tripv2pub.csv",
-        "weight": 1
-      }
-    ]
-  }
-}
-```
-
-- `counties` — FIPS GEOIDs (2-digit state + 3-digit county). Find codes at [census.gov](https://www.census.gov/library/reference/code-lists/ansi.html).
-- `surveys` — at least one survey with `weight > 0`.
+`config/config_local.json` is ready to run as-is. To model a different area, update the `counties` field with FIPS GEOIDs (2-digit state + 3-digit county) — find codes at [census.gov](https://www.census.gov/library/reference/code-lists/ansi.html). Example configs for various cities are in `config/USA/`.
 
 ### 4. Run
 
