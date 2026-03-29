@@ -6,7 +6,7 @@ An agent-based travel demand model that generates synthetic populations and acti
 
 ### 1. Prerequisites
 
-- Python 3.13+
+- Python 3.12+
 - Java 17+ (for MATSim)
 
 ### 2. Setup
