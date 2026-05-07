@@ -10,6 +10,7 @@ For architecture details, extending the system, and contributor guidance, see th
 
 - Python 3.12+
 - Java 17+ (for MATSim)
+- `osmium-tool` (required for network generation; see [docs/osm-tools-installation.md](docs/osm-tools-installation.md))
 
 ### 2. Setup
 

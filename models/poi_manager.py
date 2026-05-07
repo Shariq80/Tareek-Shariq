@@ -2,6 +2,7 @@ import json
 import time
 from typing import List, Dict, Tuple, Optional
 from datetime import datetime
+from urllib.request import Request, urlopen as _stdlib_urlopen
 
 import overpy
 from sqlalchemy import Column, String, Float, Integer, DateTime
@@ -13,6 +14,21 @@ from utils.poi_spatial_index import POISpatialIndex
 from models.models import POI
 
 logger = setup_logger(__name__)
+
+# Overpass servers reject the default Python-urllib UA with HTTP 406. Wrap the
+# bare urlopen call inside overpy with a Request that carries a real UA.
+_OVERPASS_UA = "TAREEK/1.0 (research; https://github.com/jalal1/Tareek)"
+
+
+def _overpy_urlopen_with_ua(url, data=None, *args, **kwargs):
+    req = Request(url, data=data, headers={
+        "User-Agent": _OVERPASS_UA,
+        "Referer": "https://github.com/jalal1/Tareek",
+    })
+    return _stdlib_urlopen(req, *args, **kwargs)
+
+
+overpy.urlopen = _overpy_urlopen_with_ua
 
 # ============================================================================
 # ACTIVITY TO OSM TAG MAPPING
@@ -509,6 +525,11 @@ out center;
 
                     except Exception as e:
                         logger.warning(f"{strategy_name} attempt {attempt + 1}/{max_retries} failed for {county_name}: {e}")
+                        # 406 = server is rejecting our request shape (UA ban, etc.).
+                        # Retrying with the same shape will always get the same 406, so skip retries.
+                        if "406" in str(e):
+                            logger.warning(f"{strategy_name} got 406 - non-retryable, moving to next strategy")
+                            break
                         if attempt < max_retries - 1:
                             retry_wait = wait_time * (2 ** attempt)  # Exponential backoff
                             logger.info(f"Retrying in {retry_wait} seconds...")

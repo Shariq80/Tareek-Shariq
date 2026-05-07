@@ -163,9 +163,9 @@ class ConfigManager:
         for name, value in [
             ('additionalTransferTime', '0.0'),
             ('directWalkFactor', '1.0'),
-            ('extensionRadius', '200.0'),
-            ('maxBeelineWalkConnectionDistance', '500.0'),
-            ('searchRadius', '1500.0'),
+            ('extensionRadius', '500.0'),
+            ('maxBeelineWalkConnectionDistance', '2000.0'),
+            ('searchRadius', '3000.0'),
         ]:
             ET.SubElement(router, 'param', name=name, value=value)
 

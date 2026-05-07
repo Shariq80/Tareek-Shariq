@@ -88,9 +88,9 @@
     </module>
     <module name="subtourModeChoice">
         <!-- Modes that agents can switch between for subtours -->
-        <param name="modes" value="car,pt,walk,bike" />
+        <param name="modes" value="car,pt,walk" />
         <!-- Whether agents must have a chain-based mode (e.g. car requires returning to where it was parked) -->
-        <param name="chainBasedModes" value="car,bike" />
+        <param name="chainBasedModes" value="car" />
         <!-- Consider only trips within a closed subtour, not the entire plan -->
         <param name="considerCarAvailability" value="true" />
     </module>
@@ -98,6 +98,10 @@
         <!-- fraction of iterations at which MSA score averaging is started. The matsim theory department suggests to use this together with switching off choice set innovation (where a similar switch exists), but it has not been tested yet. -->
         <param name="fractionOfIterationsToStartScoreMSA" value="0.8" />
         <parameterset type="scoringParameters">
+            <!-- Per-hour disutility of waiting for PT. Default is -6 util/hr which is harsh and pushes agents off transit during MATSim re-planning; -3 is more in line with calibrated multimodal studies and lets the access/egress walk legs not dominate the PT score. -->
+            <param name="waitingPt" value="-3.0" />
+            <!-- Per-transfer disutility. Keep MATSim default; tuning this is rarely the right lever. -->
+            <param name="utilityOfLineSwitch" value="-1.0" />
             <parameterset type="activityParams">
                 <param name="activityType" value="Work" />
                 <param name="minimalDuration" value="06:00:00" />
@@ -157,21 +161,24 @@
             </parameterset>
             <parameterset type="modeParams">
                 <param name="mode" value="car" />
+                <!-- Per-meter monetary cost (fuel + wear). At marginalUtilityOfMoney=1 this is ~$0.20/km. -->
                 <param name="monetaryDistanceRate" value="-0.0002" />
+                <!-- Daily fixed cost of car use (parking + ownership share). Keeps car attractive for long trips but discourages it for short ones, which is the asymmetry that lets PT/active win where they should. -->
+                <param name="dailyMonetaryConstant" value="-3.0" />
             </parameterset>
             <parameterset type="modeParams">
                 <param name="mode" value="pt" />
-                <param name="constant" value="-1.0" />
+                <!-- Per-trip alternative-specific constant. Default is the *base* preference;
+                     per-region overrides (NYC, Chicago) bump this up via demand_estimator. -->
+                <param name="constant" value="-0.5" />
             </parameterset>
             <parameterset type="modeParams">
                 <param name="mode" value="walk" />
-                 <param name="constant" value="-2.0" />
-                 <param name="marginalUtilityOfTraveling_util_hr" value="-12.0" />
-            </parameterset>
-            <parameterset type="modeParams">
-                <param name="mode" value="bike" />
-                <param name="constant" value="-1.5" />
-                <param name="marginalUtilityOfTraveling_util_hr" value="-8.0" />
+                <!-- Raised from -1.0: suppresses walk for suburban trip distances where
+                     car is the realistic alternative. Distance penalty handles long walks;
+                     constant handles the modal preference gap vs. car. -->
+                <param name="constant" value="-3.0" />
+                <param name="marginalUtilityOfDistance_util_m" value="-0.0006" />
             </parameterset>
             <!-- <parameterset type="modeParams">
                 <param name="mode" value="ride" />

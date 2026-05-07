@@ -360,6 +360,7 @@ class ExperimentRunner:
         logger.info("=" * 60)
 
         from utils.coordinates import detect_utm_epsg
+        from utils.region_utils import ensure_counties_in_db
         from models.models import County
         from utils.duckdb_manager import DBManager
 
@@ -367,16 +368,15 @@ class ExperimentRunner:
         data_dir = self.config['data']['data_dir']
         db_manager = DBManager(data_dir)
 
-        with db_manager.Session() as session:
+        ensure_counties_in_db(county_geoids, db_manager)
+
+        with db_manager.session_scope() as session:
             counties = session.query(County).filter(
                 County.geoid.in_(county_geoids)
             ).all()
 
             if not counties:
-                raise RuntimeError(
-                    f"No counties found in database for GEOIDs: {county_geoids}. "
-                    "Run notebooks/0.setup_global_data.ipynb first."
-                )
+                raise RuntimeError(f"Failed to fetch counties for GEOIDs: {county_geoids}")
 
             # Extract data while session is open
             county_names = [c.county_name for c in counties]
