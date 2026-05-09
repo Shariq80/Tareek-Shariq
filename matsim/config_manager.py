@@ -14,19 +14,29 @@ logger = logging.getLogger(__name__)
 class ConfigManager:
     """Manage MATSim configuration files"""
 
-    def __init__(self, config: Dict):
+    def __init__(self, config: Dict, config_dir: Optional[Path] = None):
         """
         Initialize config manager
 
         Args:
             config: Main configuration dictionary from config.json
+            config_dir: Directory containing the region's config.json.
+                If provided, get_template_path checks here for a region-specific
+                config.xml (written by mode_share_estimator) before falling back
+                to matsim/configs/{mode}/config.xml.
         """
         self.config = config
         self.matsim_config = config.get('matsim', {})
+        self.config_dir = config_dir
 
     def get_template_path(self, mode: Optional[str] = None) -> Path:
         """
-        Get path to config template for specified mode
+        Get path to config template for specified mode.
+
+        Lookup order:
+          1. <config_dir>/config.xml  — region-specific file written by
+             mode_share_estimator (present only when the estimator has run)
+          2. matsim/configs/{mode}/config.xml  — global default
 
         Args:
             mode: Simulation mode ('basic', 'uber', etc.). If None, uses config default
@@ -37,13 +47,20 @@ class ConfigManager:
         if mode is None:
             mode = self.matsim_config.get('mode', 'basic')
 
-        # Config templates are in matsim/configs/{mode}/
+        # Region-specific override takes priority
+        if self.config_dir is not None:
+            region_path = Path(self.config_dir) / 'config.xml'
+            if region_path.exists():
+                logger.info(f"Using region-specific config.xml: {region_path}")
+                return region_path
+
+        # Global fallback
         template_path = Path(__file__).parent / 'configs' / mode / 'config.xml'
 
         if not template_path.exists():
             raise FileNotFoundError(f"Config template not found: {template_path}")
 
-        logger.info(f"Using config template: {template_path}")
+        logger.info(f"Using global config template: {template_path}")
         return template_path
 
     def load_template(self, mode: Optional[str] = None) -> ET.ElementTree:
@@ -89,6 +106,88 @@ class ConfigManager:
                         return
 
         logger.warning(f"Parameter not found: {module_name}.{param_name}")
+
+    def update_mode_param(
+        self,
+        tree: ET.ElementTree,
+        mode: str,
+        param_name: str,
+        param_value: str,
+    ):
+        """Update a per-mode scoring parameter inside scoring/scoringParameters/modeParams.
+
+        The MATSim scoring module nests mode-specific scoring under
+        ``<parameterset type="scoringParameters"><parameterset type="modeParams">``
+        keyed by ``<param name="mode" value="..."/>``. The flat
+        ``module.parameter`` addressing in :meth:`update_parameter` cannot
+        reach these nodes, so we walk into them explicitly and either update
+        the existing param or insert a new one.
+        """
+        root = tree.getroot()
+        scoring_module = None
+        for module in root.findall('module'):
+            if module.get('name') == 'scoring':
+                scoring_module = module
+                break
+        if scoring_module is None:
+            logger.warning(f"scoring module missing — cannot set modeParams.{mode}.{param_name}")
+            return
+
+        scoring_params = scoring_module.find("parameterset[@type='scoringParameters']")
+        if scoring_params is None:
+            logger.warning(f"scoringParameters missing — cannot set modeParams.{mode}.{param_name}")
+            return
+
+        target_block = None
+        for ps in scoring_params.findall("parameterset[@type='modeParams']"):
+            mode_param = ps.find("param[@name='mode']")
+            if mode_param is not None and mode_param.get('value') == mode:
+                target_block = ps
+                break
+
+        if target_block is None:
+            target_block = ET.SubElement(scoring_params, 'parameterset', {'type': 'modeParams'})
+            ET.SubElement(target_block, 'param', {'name': 'mode', 'value': mode})
+            logger.info(f"Created new modeParams block for mode={mode}")
+
+        existing = target_block.find(f"param[@name='{param_name}']")
+        if existing is not None:
+            existing.set('value', str(param_value))
+        else:
+            ET.SubElement(target_block, 'param', {'name': param_name, 'value': str(param_value)})
+        logger.info(f"Applied scoring.modeParams.{mode}.{param_name} = {param_value}")
+
+    def update_scoring_param(
+        self,
+        tree: ET.ElementTree,
+        param_name: str,
+        param_value: str,
+    ):
+        """Update a top-level scoringParameters param (e.g. waitingPt, performing).
+
+        These live one level above modeParams: scoring/scoringParameters/<param>.
+        """
+        root = tree.getroot()
+        scoring_module = None
+        for module in root.findall('module'):
+            if module.get('name') == 'scoring':
+                scoring_module = module
+                break
+        if scoring_module is None:
+            logger.warning(f"scoring module missing — cannot set scoring.{param_name}")
+            return
+
+        scoring_params = scoring_module.find("parameterset[@type='scoringParameters']")
+        if scoring_params is None:
+            logger.warning(f"scoringParameters missing — cannot set scoring.{param_name}")
+            return
+
+        existing = scoring_params.find(f"param[@name='{param_name}']")
+        if existing is not None:
+            existing.set('value', str(param_value))
+        else:
+            ET.SubElement(scoring_params, 'param', {'name': param_name, 'value': str(param_value)})
+        logger.info(f"Applied scoring.{param_name} = {param_value}")
 
     def _get_enabled_transit_modes(self) -> list:
         """Return list of enabled mode names that map to MATSim 'pt' (transit modes)."""
@@ -160,12 +259,13 @@ class ConfigManager:
 
         # Add transitRouter module
         router = ET.SubElement(root, 'module', name='transitRouter')
+        # Kept at MATSim defaults: larger radii grow the RAPTOR candidate-stop set roughly with area (~r^2), slowing routing and inflating the transfer graph's memory footprint on large scenarios.
         for name, value in [
             ('additionalTransferTime', '0.0'),
             ('directWalkFactor', '1.0'),
-            ('extensionRadius', '500.0'),
-            ('maxBeelineWalkConnectionDistance', '2000.0'),
-            ('searchRadius', '3000.0'),
+            ('extensionRadius', '200.0'),
+            ('maxBeelineWalkConnectionDistance', '100.0'),
+            ('searchRadius', '1000.0'),
         ]:
             ET.SubElement(router, 'param', name=name, value=value)
 
@@ -248,19 +348,55 @@ class ConfigManager:
         output_dir = configurable.get('outputDirectory', 'output')
         self.update_parameter(tree, 'controller', 'outputDirectory', output_dir)
 
-        # Apply all configurable_params that use module.parameter format
+        # Apply all configurable_params that use module.parameter format.
+        # Special-case the scoring module because its mode-specific params live
+        # in nested parametersets that update_parameter cannot address:
+        #   scoring.modeParams.<mode>.<param>   -> update_mode_param
+        #   scoring.<param>                     -> update_scoring_param
+        # All other keys continue to use the flat module.parameter format.
         for param_key, value in configurable.items():
-            if '.' in param_key and param_key not in ['coordinateSystem', 'lastIteration', 'outputDirectory']:
+            if '.' not in param_key or param_key in ['coordinateSystem', 'lastIteration', 'outputDirectory']:
+                continue
+            # Skip estimator-generated annotation keys (demand_estimator stores
+            # rationale strings next to recommended values using the
+            # `_estimator_<leaf>` convention).
+            if param_key.startswith('_estimator_') or param_key.startswith('_info'):
+                continue
+            parts = param_key.split('.')
+            if parts[0] == 'scoring' and len(parts) >= 4 and parts[1] == 'modeParams':
+                # scoring.modeParams.<mode>.<param>  (param may itself contain dots)
+                mode = parts[2]
+                inner_param = '.'.join(parts[3:])
+                self.update_mode_param(tree, mode, inner_param, str(value))
+            elif parts[0] == 'scoring' and len(parts) == 2:
+                # scoring.<top-level scoringParameters param>, e.g. scoring.waitingPt
+                self.update_scoring_param(tree, parts[1], str(value))
+            else:
                 module, param = param_key.split('.', 1)
                 self.update_parameter(tree, module, param, str(value))
                 logger.info(f"Applied configurable param: {module}.{param} = {value}")
+                # Capacity factors must be kept in sync between qsim and hermes
+                # because mobsim=hermes reads its own module, not qsim.
+                if module == 'qsim' and param in ('flowCapacityFactor', 'storageCapacityFactor'):
+                    self.update_parameter(tree, 'hermes', param, str(value))
+                    logger.info(f"Mirrored qsim.{param} -> hermes.{param} = {value}")
 
         # Apply custom parameters if provided (these override configurable_params)
         if custom_params:
             for module_param, value in custom_params.items():
-                if '.' in module_param:
+                if '.' not in module_param:
+                    continue
+                parts = module_param.split('.')
+                if parts[0] == 'scoring' and len(parts) >= 4 and parts[1] == 'modeParams':
+                    self.update_mode_param(tree, parts[2], '.'.join(parts[3:]), str(value))
+                elif parts[0] == 'scoring' and len(parts) == 2:
+                    self.update_scoring_param(tree, parts[1], str(value))
+                else:
                     module, param = module_param.split('.', 1)
                     self.update_parameter(tree, module, param, str(value))
+                    if module == 'qsim' and param in ('flowCapacityFactor', 'storageCapacityFactor'):
+                        self.update_parameter(tree, 'hermes', param, str(value))
+                        logger.info(f"Mirrored qsim.{param} -> hermes.{param} = {value}")
 
         # Ensure file paths are relative (network.xml, plans.xml are in same dir as config)
         self.update_parameter(tree, 'network', 'inputNetworkFile', 'network.xml')
