@@ -73,6 +73,8 @@ class FeedInfo:
     download_url: str
     bbox: Optional[BBox]
     status: str
+    is_official: bool = False
+    fallback_url: Optional[str] = None
 
 
 class GTFSManager:
@@ -236,6 +238,8 @@ class GTFSManager:
                                url_col: str, provider_col: Optional[str],
                                id_col: Optional[str], subdiv_col: Optional[str],
                                munic_col: Optional[str], status_col: Optional[str],
+                               official_col: Optional[str] = None,
+                               fallback_url_col: Optional[str] = None,
                                check_locality: bool = True) -> List[FeedInfo]:
         """
         Extract matching FeedInfo entries from a catalog DataFrame.
@@ -286,6 +290,17 @@ class GTFSManager:
                 if raw and raw != 'nan':
                     row_status = raw
 
+            is_official = False
+            if official_col:
+                raw_off = str(row.get(official_col, '')).strip().lower()
+                is_official = raw_off == 'true'
+
+            fallback_url = None
+            if fallback_url_col and fallback_url_col != url_col:
+                fb = str(row.get(fallback_url_col, '')).strip()
+                if fb and fb != 'nan' and fb != download_url:
+                    fallback_url = fb
+
             feeds.append(FeedInfo(
                 feed_id=feed_id,
                 provider=str(row.get(provider_col, '')) if provider_col else '',
@@ -295,6 +310,8 @@ class GTFSManager:
                 download_url=download_url,
                 bbox=feed_bbox,
                 status=row_status,
+                is_official=is_official,
+                fallback_url=fallback_url,
             ))
 
         if skipped_too_broad > 0:
@@ -359,6 +376,15 @@ class GTFSManager:
         if not url_col:
             raise ValueError("Could not find download URL column in catalog CSV")
 
+        # The Mobility Database mirrors feeds at urls.latest. Use it as a
+        # fallback when urls.direct_download fails (e.g., the agency's own
+        # URL goes 404 but MDB still has the last archived copy).
+        fallback_url_col = None
+        for candidate in ['urls.latest', 'urls.mirror']:
+            if candidate in df.columns and candidate != url_col:
+                fallback_url_col = candidate
+                break
+
         provider_col = self._find_provider_column(df)
         id_col = self._find_id_column(df)
 
@@ -374,6 +400,8 @@ class GTFSManager:
                 munic_col = candidate
                 break
 
+        official_col = 'is_official' if 'is_official' in df.columns else None
+
         # Phase 1: Try active feeds only (exclude deprecated/inactive)
         df_active = df
         if status_col:
@@ -385,10 +413,14 @@ class GTFSManager:
 
         feeds = self._extract_feeds_from_df(
             df_active, region_bbox, bbox_cols, url_col, provider_col,
-            id_col, subdiv_col, munic_col, status_col,
+            id_col, subdiv_col, munic_col, status_col, official_col,
+            fallback_url_col,
         )
 
-        # Phase 2: If no local feeds found, retry including deprecated/inactive
+        # Phase 2: If no local feeds found, retry including deprecated/inactive.
+        # Prefer is_official=True feeds when any are present, since deprecated
+        # status often just means the catalog hasn't been refreshed and the
+        # official feed is still the authoritative source (e.g., BJCTA mdb-2263).
         if not feeds and status_col:
             n_excluded = len(df) - len(df_active)
             if n_excluded > 0:
@@ -398,12 +430,22 @@ class GTFSManager:
                 )
                 feeds = self._extract_feeds_from_df(
                     df, region_bbox, bbox_cols, url_col, provider_col,
-                    id_col, subdiv_col, munic_col, status_col,
+                    id_col, subdiv_col, munic_col, status_col, official_col,
+                    fallback_url_col,
                 )
+                if feeds and any(f.is_official for f in feeds):
+                    official_feeds = [f for f in feeds if f.is_official]
+                    n_dropped = len(feeds) - len(official_feeds)
+                    logger.warning(
+                        f"  Found {len(official_feeds)} official feed(s) in fallback; "
+                        f"dropping {n_dropped} non-official feed(s)"
+                    )
+                    feeds = official_feeds
                 if feeds:
                     for f in feeds:
+                        tag = " [official]" if f.is_official else ""
                         logger.warning(
-                            f"  Using {f.status} feed: {f.provider} ({f.feed_id})"
+                            f"  Using {f.status} feed: {f.provider} ({f.feed_id}){tag}"
                         )
 
         elapsed = time.time() - t0
@@ -490,9 +532,54 @@ class GTFSManager:
         age = datetime.now() - mtime
         return age < timedelta(days=self.feed_max_age_days)
 
+    def _fetch_and_extract(self, url: str, feed_dir: Path, feed_id: str) -> Optional[int]:
+        """
+        Fetch a GTFS zip from a URL and extract it into feed_dir.
+
+        Returns content size in bytes on success, or None on any failure
+        (network error, HTTP error, or bad zip).
+        """
+        from urllib.parse import urlparse, urlencode, urlunparse, parse_qs
+
+        # Inject API key if one is configured for this URL's domain
+        domain = urlparse(url).hostname or ''
+        api_key = None
+        for key_domain, key_value in self.api_keys.items():
+            if key_domain in domain and key_value and key_value != 'YOUR_KEY_HERE':
+                api_key = key_value
+                break
+        if api_key:
+            parsed = urlparse(url)
+            params = parse_qs(parsed.query)
+            params['api_key'] = [api_key]
+            url = urlunparse(parsed._replace(query=urlencode(params, doseq=True)))
+            logger.debug(f"Added API key for {domain}")
+
+        try:
+            response = requests.get(url, timeout=120)
+            response.raise_for_status()
+        except requests.RequestException as e:
+            logger.warning(f"  Fetch failed for {url}: {e}")
+            return None
+
+        feed_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
+                zf.extractall(feed_dir)
+        except zipfile.BadZipFile as e:
+            logger.warning(f"  Invalid zip from {url}: {e}")
+            return None
+
+        return len(response.content)
+
     def download_feed(self, feed: FeedInfo) -> Optional[Path]:
         """
         Download and extract a GTFS feed zip file.
+
+        Tries feed.download_url first; on failure, falls back to feed.fallback_url
+        (typically the Mobility Database mirror at urls.latest). The fallback
+        rescues feeds whose original agency URL has gone 404 but whose last
+        archived copy is still mirrored by MDB.
 
         Args:
             feed: FeedInfo with download_url and feed_id
@@ -506,40 +593,23 @@ class GTFSManager:
             logger.info(f"Feed {feed.feed_id} is up to date (cached)")
             return feed_dir
 
-        logger.info(f"Downloading feed {feed.feed_id} from {feed.download_url}...")
+        candidate_urls = [feed.download_url]
+        if feed.fallback_url:
+            candidate_urls.append(feed.fallback_url)
+
         t0 = time.time()
+        size_bytes = None
+        used_url = None
+        for i, url in enumerate(candidate_urls):
+            tag = "primary" if i == 0 else "fallback"
+            logger.info(f"Downloading feed {feed.feed_id} from {url} ({tag})...")
+            size_bytes = self._fetch_and_extract(url, feed_dir, feed.feed_id)
+            if size_bytes is not None:
+                used_url = url
+                break
 
-        try:
-            url = feed.download_url
-            # Check if an API key is configured for this feed's domain
-            from urllib.parse import urlparse, urlencode, urlunparse, parse_qs
-            domain = urlparse(url).hostname or ''
-            api_key = None
-            for key_domain, key_value in self.api_keys.items():
-                if key_domain in domain and key_value and key_value != 'YOUR_KEY_HERE':
-                    api_key = key_value
-                    break
-            if api_key:
-                parsed = urlparse(url)
-                params = parse_qs(parsed.query)
-                params['api_key'] = [api_key]
-                new_query = urlencode(params, doseq=True)
-                url = urlunparse(parsed._replace(query=new_query))
-                logger.debug(f"Added API key for {domain}")
-
-            response = requests.get(url, timeout=120)
-            response.raise_for_status()
-        except requests.RequestException as e:
-            logger.error(f"Failed to download feed {feed.feed_id}: {e}")
-            return None
-
-        # Extract zip
-        feed_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
-                zf.extractall(feed_dir)
-        except zipfile.BadZipFile as e:
-            logger.error(f"Invalid zip file for feed {feed.feed_id}: {e}")
+        if size_bytes is None:
+            logger.error(f"Failed to download feed {feed.feed_id} from all {len(candidate_urls)} URL(s)")
             return None
 
         # Write download marker
@@ -547,8 +617,13 @@ class GTFSManager:
         marker.write_text(datetime.now().isoformat())
 
         elapsed = time.time() - t0
-        size_kb = len(response.content) / 1024
-        logger.info(f"Downloaded feed {feed.feed_id} ({size_kb:.0f} KB, took {elapsed:.1f}s)")
+        size_kb = size_bytes / 1024
+        if used_url != feed.download_url:
+            logger.warning(
+                f"Downloaded feed {feed.feed_id} from FALLBACK URL ({size_kb:.0f} KB, took {elapsed:.1f}s)"
+            )
+        else:
+            logger.info(f"Downloaded feed {feed.feed_id} ({size_kb:.0f} KB, took {elapsed:.1f}s)")
 
         return feed_dir
 
