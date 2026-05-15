@@ -33,6 +33,17 @@ pip install -r requirements.txt
 
 `config/config_local.json` is ready to run as-is. To model a different area, update the `counties` field with FIPS GEOIDs (2-digit state + 3-digit county) — find codes at [census.gov](https://www.census.gov/library/reference/code-lists/ansi.html). Example configs for various cities are in `config/USA/`.
 
+#### Optional API keys
+
+The system runs without these, but you may see warnings in the logs and missing data (no ACS calibration; certain transit feeds skipped). Both are **free**:
+
+| Key | Where to register | What it's for | Where to put it in `config.json` |
+|---|---|---|---|
+| Census API key | https://api.census.gov/data/key_signup.html | Fetches ACS commute data (B08301, B08303) used to calibrate mode shares | `data.census_api_key` |
+| WMATA API key | https://developer.wmata.com/ | Authenticates GTFS downloads for feeds that require it (e.g., DC Metro) | `gtfs.api_keys["wmata.com"]` |
+
+Replace the placeholder values (`YOUR_CENSUS_API_KEY_HERE`, `YOUR_WMATA_API_KEY`) in your config file with the issued keys. The WMATA key is only needed if your region pulls a feed hosted on `wmata.com`; add other domain keys under `gtfs.api_keys` the same way if needed.
+
 ### 4. Run
 
 ```bash
