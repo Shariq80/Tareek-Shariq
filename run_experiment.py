@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Main Experiment Runner for MATSim Twin Cities Simulation
 
@@ -96,13 +96,6 @@ def load_shared_nonwork_data(config: Dict) -> Dict:
     logger.info(f"  Loaded {len(survey_df):,} survey trips")
     logger.info(f"  Processed {len(persons):,} persons")
 
-    # Detect census geography level from survey location IDs
-    from data_sources.base_survey_trip import BaseSurveyTrip
-    geo_level = SurveyManager.detect_geo_level_from_df(survey_df)
-    if geo_level is None:
-        geo_level = BaseSurveyTrip.GEO_BLOCK_GROUP
-    logger.info(f"  Detected survey geo level: {geo_level}")
-
     # Process chains
     use_weight = config.get('chains', {}).get('use_weighted_chains', True)
     chains = process_trip_chains(persons, use_weight=use_weight)
@@ -160,7 +153,6 @@ def load_shared_nonwork_data(config: Dict) -> Dict:
         'trip_duration_model': trip_duration_model,
         'activity_duration_model': activity_duration_model,
         'poi_spatial_index': poi_spatial_index,
-        'geo_level': geo_level,
     }
     result.update(multi_source_data)
     return result
@@ -334,6 +326,7 @@ class ExperimentRunner:
         try:
             self.validator = ConfigValidator(self.config_path)
             self.config = self.validator.validate()
+            self.config["_config_dir"] = str(self.config_path.parent)
 
             logger.info(f"Configuration file: {self.config_path}")
             logger.info(f"Experiment ID: {self.experiment_id}")
@@ -371,7 +364,7 @@ class ExperimentRunner:
 
         ensure_counties_in_db(county_geoids, db_manager)
 
-        with db_manager.session_scope() as session:
+        with db_manager.Session() as session:
             counties = session.query(County).filter(
                 County.geoid.in_(county_geoids)
             ).all()
@@ -403,6 +396,63 @@ class ExperimentRunner:
         logger.info(f"  Average centroid: ({avg_lat:.4f}, {avg_lon:.4f})")
         logger.info(f"  Detected UTM EPSG: {utm_epsg}")
         logger.info(f"  All downstream components will use {utm_epsg}")
+        logger.info("")
+
+    def setup_matsim_config(self):
+        """Write the experiment's MATSim config.xml right after the experiment
+        directory exists, before network/counts/plans generation.
+
+        Doing this early surfaces any errors in configurable_params (typos,
+        stale keys, base-template drift) in milliseconds, instead of after
+        plan generation has burned 30-90 minutes. Generating the XML only
+        needs the JSON config and the coordinate system - it doesn't read
+        the network, plans, or counts files (it just *references* them by
+        relative filename, and MATSim opens them at simulation time).
+
+        Step 5 will regenerate this file from the same inputs before running
+        the simulation; the two writes are bit-identical, so this is safe
+        even if a later step were to mutate state we depend on. The file
+        also persists for inspection if a downstream step crashes.
+        """
+        from matsim.config_manager import ConfigManager
+
+        logger.info("=" * 60)
+        logger.info("STEP 2b: GENERATING MATSIM config.xml")
+        logger.info("=" * 60)
+
+        matsim_config = self.config.get('matsim', {})
+        mode = matsim_config.get('mode', 'basic')
+        custom_params = matsim_config.get('configurable_params', {}) or None
+        coord_system = self.config.get('coordinates', {}).get('utm_epsg', 'EPSG:26915')
+
+        config_dir = self.config.get('_config_dir')
+        cm = ConfigManager(
+            self.config,
+            config_dir=Path(config_dir) if config_dir else None,
+        )
+
+        config_path = self.experiment_dir / 'config.xml'
+        try:
+            cm.generate_config(
+                output_path=config_path,
+                experiment_path=self.experiment_dir,
+                coordinate_system=coord_system,
+                mode=mode,
+                custom_params=custom_params,
+            )
+        except Exception as e:
+            logger.error(f"MATSim config generation failed: {e}")
+            raise RuntimeError(
+                f"MATSim config generation failed before any expensive work "
+                f"was done. Fix the configurable_params entry and re-run. "
+                f"Underlying error: {e}"
+            ) from e
+
+        # Record the path so it can be used by subsequent steps and the
+        # final metadata. Step 5 will overwrite the file with the same
+        # content; the path stays valid.
+        self.matsim_config_path = config_path
+        logger.info(f"  Generated: {config_path}")
         logger.info("")
 
     def setup_experiment_directory(self):
@@ -580,6 +630,31 @@ class ExperimentRunner:
                     "Disabling transit_network in config for this experiment."
                 )
                 self.config['matsim']['transit_network'] = False
+
+                # Without a transit network, MATSim falls back to teleported pt
+                # (free, fast, no fare/waiting/transfers) which dominates car
+                # during replanning. Disable every pt-mapped mode and strip pt
+                # from subtourModeChoice.modes so replanning cannot insert pt.
+                disabled_pt_modes = []
+                for mode_name, mode_cfg in self.config.get('modes', {}).items():
+                    if isinstance(mode_cfg, dict) and mode_cfg.get('matsim_mode') == 'pt' \
+                            and mode_cfg.get('enabled', True):
+                        mode_cfg['enabled'] = False
+                        disabled_pt_modes.append(mode_name)
+                if disabled_pt_modes:
+                    logger.warning(
+                        f"Disabled pt-mapped modes for this experiment: "
+                        f"{', '.join(disabled_pt_modes)}"
+                    )
+
+                configurable = self.config['matsim'].setdefault('configurable_params', {})
+                existing_modes = configurable.get('subtourModeChoice.modes', 'car,pt,walk')
+                kept = [m for m in existing_modes.split(',') if m.strip() and m.strip() != 'pt']
+                configurable['subtourModeChoice.modes'] = ','.join(kept)
+                logger.warning(
+                    f"Stripped pt from subtourModeChoice.modes: "
+                    f"{existing_modes} -> {configurable['subtourModeChoice.modes']}"
+                )
 
             return network_path
 
@@ -814,7 +889,7 @@ class ExperimentRunner:
             if rebuild and self.counts_path.exists():
                 logger.info("Rebuilding counts.xml (counts.rebuild = true)")
 
-            # Setup FHA counts data (ETL from zip → DB) — skip when weight is 0
+            # Setup FHA counts data (ETL from zip â†’ DB) â€” skip when weight is 0
             fha_weight = counts_config.get('fha', {}).get('weight', 0.5)
             db_manager = None
             try:
@@ -827,7 +902,7 @@ class ExperimentRunner:
                     fha_manager = FHACountsManager(self.config, db_manager)
                     fha_success = fha_manager.setup()
                     if not fha_success:
-                        logger.warning("FHA counts setup failed — continuing without FHA data")
+                        logger.warning("FHA counts setup failed â€” continuing without FHA data")
                 else:
                     logger.info("FHA counts setup skipped (weight=0)")
             except Exception as e:
@@ -918,11 +993,9 @@ class ExperimentRunner:
             from models.home_locs_v2 import ensure_home_locations
             from models.work_locs_v2 import ensure_work_locations
             from models.poi_manager import ensure_pois
-            from data_sources.survey_manager import ensure_surveys
             ensure_home_locations(self.config)
             ensure_work_locations(self.config)
             ensure_pois(self.config)
-            ensure_surveys(self.config)
 
             # Get target plans from config
             target_plans = self.config['plan_generation'].get('target_plans', 1000)
@@ -1346,6 +1419,15 @@ class ExperimentRunner:
 
             # Step 2: Setup experiment directory
             self.setup_experiment_directory()
+
+            # Step 2b: Generate the MATSim config.xml right away. This
+            # catches typos and stale keys in configurable_params in ms,
+            # before the expensive network + counts + plans steps. The
+            # generated XML references network.xml / plans.xml / counts.xml
+            # by relative filename only - those files don't need to exist
+            # yet. Step 5 will rewrite the same file with identical content
+            # right before launching MATSim.
+            self.setup_matsim_config()
 
             # Step 3: Setup network
             self.setup_network()
