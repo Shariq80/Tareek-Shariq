@@ -57,7 +57,7 @@ class TeeWriter:
 # Census ACS API
 # ---------------------------------------------------------------------------
 ACS_BASE_URL = "https://api.census.gov/data/{year}/acs/acs5"
-ACS_YEAR = 2022  # latest 5-year ACS
+ACS_YEAR = 2023  # latest 5-year ACS
 
 # B08301: Means of Transportation to Work
 #   _001E  Total workers 16+
@@ -111,7 +111,7 @@ def _request_acs_with_retry(
     params: Dict[str, str],
     state_fips: str,
     timeout: int = 60,
-    max_attempts: int = 3,
+    max_attempts: int = 5,
 ) -> requests.Response | None:
     """GET the ACS endpoint with retries on timeout / connection / 5xx.
 
@@ -119,8 +119,15 @@ def _request_acs_with_retry(
     the run log instead of being silently swallowed. Returns the successful
     Response, or None if all attempts failed (caller should treat the state
     as missing, not silently zero).
+
+    Backoff schedule: 5s, 15s, 30s, 60s between attempts (capped). Longer
+    than typical API rate-limit waits because the common failure mode here
+    is local DNS / VPN flakiness (NameResolutionError on api.census.gov),
+    which can take 10-30s to recover.
     """
-    backoff = 2.0
+    import time
+    backoff = 5.0
+    max_backoff = 60.0
     last_err: str | None = None
     for attempt in range(1, max_attempts + 1):
         try:
@@ -138,11 +145,18 @@ def _request_acs_with_retry(
         except requests.Timeout:
             last_err = f"timeout after {timeout}s"
             print(f"  Census API state {state_fips}: attempt {attempt}/{max_attempts} "
-                  f"TIMED OUT (>{timeout}s){'  retrying...' if attempt < max_attempts else ''}")
+                  f"TIMED OUT (>{timeout}s)"
+                  f"{f'  retrying in {backoff:.0f}s...' if attempt < max_attempts else ''}")
         except requests.ConnectionError as e:
-            last_err = f"connection error: {e}"
+            # Surface DNS-resolution failures distinctly — those usually indicate
+            # local network / VPN issues rather than a Census API outage.
+            err_str = str(e)
+            is_dns = "NameResolutionError" in err_str or "Failed to resolve" in err_str
+            last_err = f"DNS resolution failure: {e}" if is_dns else f"connection error: {e}"
+            kind = "DNS RESOLUTION FAILED" if is_dns else "connection error"
             print(f"  Census API state {state_fips}: attempt {attempt}/{max_attempts} "
-                  f"connection error{'  retrying...' if attempt < max_attempts else ''}")
+                  f"{kind}"
+                  f"{f'  retrying in {backoff:.0f}s...' if attempt < max_attempts else ''}")
         except requests.HTTPError as e:
             # Non-5xx HTTP errors: don't retry, surface and bail.
             print(f"  Census API state {state_fips}: HTTP error {e} — not retrying")
@@ -150,12 +164,12 @@ def _request_acs_with_retry(
         except requests.RequestException as e:
             last_err = str(e)
             print(f"  Census API state {state_fips}: attempt {attempt}/{max_attempts} "
-                  f"failed ({e}){'  retrying...' if attempt < max_attempts else ''}")
+                  f"failed ({e})"
+                  f"{f'  retrying in {backoff:.0f}s...' if attempt < max_attempts else ''}")
 
         if attempt < max_attempts:
-            import time
             time.sleep(backoff)
-            backoff *= 2
+            backoff = min(backoff * 2, max_backoff)
 
     print(f"  !! Census API state {state_fips}: gave up after {max_attempts} attempts "
           f"(last error: {last_err}). This state's counties will be MISSING from ACS data.")
@@ -742,9 +756,62 @@ def _get_nonwork_purposes(config: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
 # Transit calibration from ACS bus/rail data
 # ---------------------------------------------------------------------------
 
+# NHTS national baselines (approximate). Kept at module scope so the empirical
+# back-calculation can reuse the exact same constants as the forward formula.
+NHTS_BUS_SHARE = 0.02
+NHTS_RAIL_SHARE = 0.01
+
+
+def compute_empirical_chain_reduction(
+    experiment_feedback: Dict[str, Any] | None,
+) -> Dict[str, float] | None:
+    """Back out chain_reduction per mode from a prior run's recorded stats.
+
+    Uses the end-to-end identity
+        observed_output_share = (1 - chain_reduction) * prefilt_rate
+    with
+        prefilt_rate = (1 - blend_weight) * nhts_share + blend_weight * config_rate
+    where mode_choice's mode_distribution gives `observed_output_share` and the
+    prior run's config (snapshotted in experiment_summary.json under
+    `parameters` -> `modes`) gives `blend_weight` and `config_rate`.
+
+    Returns {"bus": float, "rail": float} (each key omitted if it cannot be
+    derived) or None if no usable data is present. Values are clamped to a
+    plausible [0.05, 0.90] band; anything outside that range almost certainly
+    means the formula's preconditions don't hold (e.g. config_rate=0).
+    """
+    if not experiment_feedback:
+        return None
+    summary = experiment_feedback.get("summary") or {}
+    mode_choice = summary.get("mode_choice") or {}
+    mode_dist = mode_choice.get("mode_distribution") or {}
+    prior_modes = (summary.get("parameters") or {}).get("modes") or {}
+    if not mode_dist or not prior_modes:
+        return None
+
+    out: Dict[str, float] = {}
+    for mode_name, nhts_share in (("bus", NHTS_BUS_SHARE), ("rail", NHTS_RAIL_SHARE)):
+        cfg = prior_modes.get(mode_name) or {}
+        config_rate = cfg.get("config_rate")
+        bw = cfg.get("blend_weight")
+        observed = mode_dist.get(mode_name)
+        if config_rate is None or bw is None or observed is None:
+            continue
+        prefilt = (1 - bw) * nhts_share + bw * config_rate
+        if prefilt <= 0:
+            continue
+        cr = 1.0 - (observed / prefilt)
+        if cr < 0.05 or cr > 0.90:
+            # Outside plausible band; treat as unmeasured and fall back to seed.
+            continue
+        out[mode_name] = cr
+    return out or None
+
+
 def compute_transit_calibration(
     acs_data: Dict[str, Dict[str, int]],
     config: Dict[str, Any],
+    empirical_chain_reduction: Dict[str, float] | None = None,
 ) -> Dict[str, Any]:
     """Compute transit mode parameter recommendations from ACS county-level data.
 
@@ -766,6 +833,9 @@ def compute_transit_calibration(
     Args:
         acs_data: Per-county ACS data from fetch_acs_commute_data().
         config: Current config dictionary.
+        empirical_chain_reduction: Optional {"bus": float, "rail": float} measured
+            from a prior run's experiment_summary.json. When provided, overrides
+            the cold-start seed table for the mode(s) present.
 
     Returns:
         Dict with keys:
@@ -839,25 +909,37 @@ def compute_transit_calibration(
     cur_storage_cap = matsim_params.get("qsim.storageCapacityFactor", cur_scaling)
 
     # --- NHTS national baselines (approximate) ---
-    nhts_bus_share = 0.02
-    nhts_rail_share = 0.01
+    nhts_bus_share = NHTS_BUS_SHARE
+    nhts_rail_share = NHTS_RAIL_SHARE
 
     # --- Compute recommended parameters ---
-    # The chain consistency intersection filter removes a fraction of
-    # transit-eligible chains. The reduction depends on transit coverage
-    # density: denser networks lose fewer chains.
-    #   - Very high transit (>20% share): ~40-50% reduction
-    #   - High transit (10-20%): ~50-60% reduction
-    #   - Medium transit (5-10%): ~55-65% reduction
-    #   - Low transit (<5%): ~60-70% reduction
+    # chain_reduction = 1 - (observed_pt_share / prefilt_pt_rate). Empirical
+    # value (from a prior run's experiment_summary.json) is preferred; the
+    # table below is the cold-start seed.
+    #
+    # Seed values were lowered by ~15pp vs. the original heuristic to reflect
+    # walk-pass-through (mode_choice.py:541-554): short interior legs are now
+    # excused from the chain intersection and emitted as walk, so mixed-
+    # feasibility chains no longer get dropped wholesale.
+    bus_empirical = (empirical_chain_reduction or {}).get("bus")
+    rail_empirical = (empirical_chain_reduction or {}).get("rail")
+
     if transit_share > 0.20:
-        chain_reduction = 0.45
+        chain_reduction_seed = 0.30
     elif transit_share > 0.10:
-        chain_reduction = 0.55
+        chain_reduction_seed = 0.40
     elif transit_share > 0.05:
-        chain_reduction = 0.60
+        chain_reduction_seed = 0.45
     else:
-        chain_reduction = 0.65
+        chain_reduction_seed = 0.50
+
+    chain_reduction_bus = bus_empirical if bus_empirical is not None else chain_reduction_seed
+    chain_reduction_rail = rail_empirical if rail_empirical is not None else chain_reduction_seed
+    # Clamp to a safe band so a degenerate prior run can't blow up prefilt.
+    chain_reduction_bus = max(0.05, min(chain_reduction_bus, 0.90))
+    chain_reduction_rail = max(0.05, min(chain_reduction_rail, 0.90))
+    # Legacy alias kept for log/reporting paths that still expect a single value.
+    chain_reduction = (chain_reduction_bus + chain_reduction_rail) / 2.0
 
     # ACS is commute-only; all-trip-types transit share is typically lower.
     # For regions with high commute transit share, all-trip share is roughly
@@ -873,9 +955,11 @@ def compute_transit_calibration(
     target_output_rail = rail_share * all_trip_factor
 
     # Pre-filter rate = target output / (1 - chain_reduction)
-    # This is the rate we need BEFORE the chain consistency filter removes chains
-    prefilt_bus = target_output_bus / (1 - chain_reduction) if chain_reduction < 1 else target_output_bus
-    prefilt_rail = target_output_rail / (1 - chain_reduction) if chain_reduction < 1 else target_output_rail
+    # This is the rate we need BEFORE the chain consistency filter removes chains.
+    # bus and rail use independently estimated reductions when an empirical
+    # value is available (their feasibility geometry is different).
+    prefilt_bus = target_output_bus / (1 - chain_reduction_bus) if chain_reduction_bus < 1 else target_output_bus
+    prefilt_rail = target_output_rail / (1 - chain_reduction_rail) if chain_reduction_rail < 1 else target_output_rail
 
     # blend_weight: how much to lean on config_rate vs NHTS survey rate
     # If regional transit is close to NHTS national (~3-5%), use lower blend_weight
@@ -952,7 +1036,8 @@ def compute_transit_calibration(
             "recommended": rec_bus_config_rate,
             "reason": f"ACS regional bus commute share is {bus_share:.1%}. "
                       f"Target all-trip output ~{target_output_bus:.1%} after "
-                      f"~{chain_reduction:.0%} chain consistency reduction. "
+                      f"~{chain_reduction_bus:.0%} chain consistency reduction "
+                      f"({'empirical' if bus_empirical is not None else 'seed'}). "
                       f"Pre-filter rate ~{prefilt_bus:.1%} with blend_weight={rec_blend_weight}.",
         })
 
@@ -989,7 +1074,8 @@ def compute_transit_calibration(
                       f"commuter={total_commuter_rail/total_workers:.1%}, "
                       f"light rail={total_light_rail/total_workers:.1%}). "
                       f"Target all-trip output ~{target_output_rail:.1%} after "
-                      f"~{chain_reduction:.0%} chain consistency reduction.",
+                      f"~{chain_reduction_rail:.0%} chain consistency reduction "
+                      f"({'empirical' if rail_empirical is not None else 'seed'}).",
         })
 
     # Rail blend_weight
@@ -1059,6 +1145,13 @@ def compute_transit_calibration(
             "target_output": round(target_output_rail, 4),
         },
         "chain_reduction": chain_reduction,
+        "chain_reduction_bus": round(chain_reduction_bus, 4),
+        "chain_reduction_rail": round(chain_reduction_rail, 4),
+        "chain_reduction_source": {
+            "bus": "empirical" if bus_empirical is not None else "seed",
+            "rail": "empirical" if rail_empirical is not None else "seed",
+            "seed": round(chain_reduction_seed, 4),
+        },
         "all_trip_factor": all_trip_factor,
         "scaling_factor": rec_scaling,
         "recommendations": recommendations,
@@ -1285,34 +1378,168 @@ def recommend_adjustments(
                               f"(most plans are simple Home-Work-Home with 2 legs).",
                 })
 
-        # Check evaluation metrics — the real ground truth
+        # Check evaluation metrics — the real ground truth.
+        #
+        # The previous version of this block fired needs_more_demand whenever
+        # mean_pct_error < -30%. That metric is volume-weighted and dragged
+        # down catastrophically by boundary count stations capturing
+        # through-traffic from outside the modeled area (typical pattern:
+        # a few freeway-boundary stations show simulated ~2% of observed,
+        # which has nothing to do with demand). Recommending a 2-3x
+        # scaling-factor bump in that case overloads the network because
+        # flow/storage capacity factors stay at their original values, and
+        # the geometric coverage gap remains unfixed.
+        #
+        # New gate (two checks, both must fail before recommending more demand):
+        #   1) Yield: output_trips_count / (survey_tpc × total_pop × sf).
+        #      Measures whether the simulation produced the trip volume that
+        #      the survey benchmark predicts. yield >= 0.85 means demand is
+        #      already on-target by survey standards, regardless of count
+        #      gaps.
+        #   2) Interquartile mean station ratio: robust per-station measure
+        #      that drops the worst & best 25% of stations. iqr_mean >= 0.7
+        #      means the bulk of stations are reasonably matched even if a
+        #      few outliers tank the unweighted mean.
         if eval_data:
             mean_pct_error = eval_data.get("mean_pct_error", 0)
             geh_lt_5 = eval_data.get("geh_lt_5_pct", 0)
+            iqr_mean = eval_data.get("interquartile_mean_ratio")
+            pct_below_10 = eval_data.get("pct_stations_below_10pct", 0.0)
+            num_below_10 = eval_data.get("num_stations_below_10pct", 0)
 
-            if mean_pct_error < -30:
-                # Simulation significantly under-estimates real traffic
-                # Back-calculate how much more demand we need:
-                # If mean_pct_error = -92%, sim produces ~8% of real volume
-                # We need roughly 1/(1 + mean_pct_error/100) times more demand
-                actual_fraction = 1 + mean_pct_error / 100  # e.g. 0.08 for -92%
-                if actual_fraction > 0:
-                    demand_multiplier = 1.0 / actual_fraction
+            # --- Gate 1: Yield (survey-benchmark trip volume vs. simulated) ---
+            # Trip-count yield is computed from output_trips_count (already a
+            # scaled-population number) against the survey-derived expected
+            # scaled trip count. The survey benchmark (~2.35 trips/capita/day
+            # for NHTS-blended national rate) is a conservative lower bound
+            # for most metros, so a yield near 1.0 means we are already at
+            # or above the survey-implied volume — any remaining gap to
+            # observed traffic is geometric, not demand-side.
+            actual_trips = summary.get("matsim_output", {}).get("output_trips_count", 0)
+            expected_unscaled = total_pop * benchmarks["survey_trips_per_capita"]
+            expected_scaled = expected_unscaled * scaling_factor
+            yield_ratio = actual_trips / expected_scaled if expected_scaled > 0 else 0.0
+
+            # --- Gate 2: Interquartile-mean station ratio ---
+            # Falls back to (1 + mean_pct_error/100) if iqr_mean wasn't
+            # written (older experiments). That fallback preserves prior
+            # behaviour for old summaries while the new field rolls in.
+            if iqr_mean is None or iqr_mean <= 0:
+                iqr_mean_used = max(1.0 + mean_pct_error / 100.0, 0.0)
+                iqr_source = "fallback from mean_pct_error"
+            else:
+                iqr_mean_used = float(iqr_mean)
+                iqr_source = "interquartile_mean_ratio"
+
+            YIELD_GATE = 0.85
+            IQR_GATE = 0.70
+
+            yield_passes = yield_ratio >= YIELD_GATE   # demand looks fine
+            iqr_passes = iqr_mean_used >= IQR_GATE     # stations look fine
+
+            # Always report what we measured, regardless of decision.
+            recommendations.append({
+                "parameter": "_info.experiment_yield",
+                "current": (
+                    f"output_trips={actual_trips:,}, "
+                    f"expected_scaled={expected_scaled:,.0f}, "
+                    f"yield={yield_ratio:.1%}"
+                ),
+                "recommended": f"yield >= {YIELD_GATE:.0%}",
+                "reason": (
+                    f"Yield = output_trips / (survey_tpc * total_pop * sf) "
+                    f"= {actual_trips:,} / ({benchmarks['survey_trips_per_capita']:.2f} "
+                    f"* {total_pop:,} * {scaling_factor}) = {yield_ratio:.1%}. "
+                    f"{'PASSES' if yield_passes else 'FAILS'} the {YIELD_GATE:.0%} gate."
+                ),
+            })
+            recommendations.append({
+                "parameter": "_info.station_ratio_summary",
+                "current": (
+                    f"iqr_mean={iqr_mean_used:.1%} ({iqr_source}), "
+                    f"mean_pct_error={mean_pct_error:.1f}%, "
+                    f"GEH<5={geh_lt_5:.1f}%, "
+                    f"stations<10%={num_below_10} ({pct_below_10:.0f}%)"
+                ),
+                "recommended": f"iqr_mean >= {IQR_GATE:.0%}",
+                "reason": (
+                    f"Interquartile mean of per-station sim/obs ratios drops "
+                    f"the worst & best 25% of stations and averages the middle 50%. "
+                    f"Robust to boundary stations with through-traffic from outside "
+                    f"the modeled area. {'PASSES' if iqr_passes else 'FAILS'} the "
+                    f"{IQR_GATE:.0%} gate."
+                ),
+            })
+
+            # Decision:
+            if yield_passes:
+                # Demand-on-target by survey standards. The remaining gap to
+                # observed traffic (if any) is geometric/network, not demand.
+                if not iqr_passes:
+                    recommendations.append({
+                        "parameter": "_info.geometric_coverage_gap",
+                        "current": (
+                            f"yield={yield_ratio:.0%} (demand OK) but "
+                            f"iqr_mean={iqr_mean_used:.0%} (stations under-counted)"
+                        ),
+                        "recommended": "review boundary stations; consider expanding modeled region",
+                        "reason": (
+                            f"Simulated trip volume matches survey benchmark "
+                            f"({yield_ratio:.0%} of expected). The remaining count "
+                            f"shortfall is NOT a demand problem and cannot be fixed "
+                            f"by raising scaling_factor. Likely cause: boundary count "
+                            f"stations on freeways/arterials capturing through-traffic "
+                            f"from origins/destinations outside the modeled area. "
+                            f"{num_below_10} station(s) have sim < 10% of "
+                            f"observed - characteristic of boundary stations. "
+                            f"Recommended actions: (1) exclude boundary stations from the "
+                            f"evaluation, (2) expand the modeled region if external trips "
+                            f"dominate, (3) accept the gap as inherent to a geographically "
+                            f"bounded simulation. Do NOT raise scaling_factor."
+                        ),
+                    })
+                # In both yield-passes branches, do not set needs_more_demand.
+            else:
+                # Yield is below 0.85. Only fire the demand bump if iqr also
+                # confirms widespread under-simulation, not just outliers.
+                if not iqr_passes:
+                    actual_fraction = max(yield_ratio, 0.1)
+                    demand_multiplier = min(1.0 / actual_fraction, 10.0)
+                    needs_more_demand = True
+                    recommendations.append({
+                        "parameter": "_info.experiment_under_demand",
+                        "current": (
+                            f"yield={yield_ratio:.0%}, iqr_mean={iqr_mean_used:.0%}, "
+                            f"mean_pct_error={mean_pct_error:.1f}%, GEH<5={geh_lt_5:.1f}%"
+                        ),
+                        "recommended": f"yield >= {YIELD_GATE:.0%} AND iqr_mean >= {IQR_GATE:.0%}",
+                        "reason": (
+                            f"Both gates failed: simulated trip volume is "
+                            f"{(1-yield_ratio):.0%} below the survey benchmark AND "
+                            f"the interquartile-mean station ratio is "
+                            f"{iqr_mean_used:.0%}. Demand multiplier "
+                            f"~{demand_multiplier:.1f}x needed to close the volume gap."
+                        ),
+                    })
                 else:
-                    demand_multiplier = 10.0  # cap
-                # Cap at a reasonable multiplier to avoid overshooting
-                demand_multiplier = min(demand_multiplier, 10.0)
-                needs_more_demand = True
-
-                recommendations.append({
-                    "parameter": "_info.experiment_under_demand",
-                    "current": f"mean_pct_error={mean_pct_error:.1f}%, GEH<5={geh_lt_5:.1f}%",
-                    "recommended": "mean_pct_error ~ 0%, GEH<5 > 85%",
-                    "reason": f"Previous experiment shows simulated volumes are "
-                              f"{abs(mean_pct_error):.0f}% below observed traffic. "
-                              f"Demand needs ~{demand_multiplier:.1f}x increase to match counts. "
-                              f"(GEH<5 target: >85%, current: {geh_lt_5:.1f}%)",
-                })
+                    # Yield low but stations look fine - probably scaling factor
+                    # is too high relative to true trips/capita, or the survey
+                    # benchmark is mis-estimated. Either way, do not auto-bump.
+                    recommendations.append({
+                        "parameter": "_info.yield_low_stations_ok",
+                        "current": (
+                            f"yield={yield_ratio:.0%} (low) but "
+                            f"iqr_mean={iqr_mean_used:.0%} (stations OK)"
+                        ),
+                        "recommended": "manual review of survey_trips_per_capita and scaling_factor",
+                        "reason": (
+                            f"Trip volume is below survey expectation but the station "
+                            f"counts look reasonable. This is unusual - the survey "
+                            f"benchmark may be too high for this region, OR the plan "
+                            f"generator is failing to produce some plans. No automatic "
+                            f"scaling-factor change is recommended; investigate manually."
+                        ),
+                    })
 
     # Two distinct kinds of "needs adjustment":
     #   A) tpc < target_low                — sim under-generates trips/agent;
@@ -1437,10 +1664,18 @@ def recommend_adjustments(
                 f"Experiment shows volumes ~{(1 - 1/demand_multiplier):.0%} below "
                 f"observed (demand multiplier {demand_multiplier:.2f}x). "
                 f"SF multiplier = {demand_multiplier:.2f}^{sf_exponent:.2f} "
-                f"× (1/{plan_gen_ratio:.2f} plan-gen yield) "
-                f"= {sf_mult:.2f}x → {current_sf:.3f} → {new_sf:.3f}. "
-                f"Capacity factors unchanged (cap_ratio={cap_ratio:.2f}x). "
-                f"countsScaleFactor will auto-adjust to 1/{new_sf} = {1/new_sf:.1f}."
+                f"x (1/{plan_gen_ratio:.2f} plan-gen yield) "
+                f"= {sf_mult:.2f}x -> {current_sf:.3f} -> {new_sf:.3f}. "
+                f"countsScaleFactor will auto-adjust to 1/{new_sf} = {1/new_sf:.1f}. "
+                f"WARNING: qsim.flowCapacityFactor ({flow_cap}) and qsim.storageCapacityFactor "
+                f"({storage_cap}) are UNCHANGED, leaving cap_ratio={cap_ratio:.2f}x. "
+                f"At scaling_factor={new_sf:.3f} with capacity at {flow_cap}, agents will "
+                f"compete for less capacity than they need, producing artificial congestion, "
+                f"stuck agents, and a different equilibrium. If you accept this recommendation "
+                f"you should ALSO raise flowCapacityFactor and storageCapacityFactor in lockstep "
+                f"(target: flow ~ {new_sf:.3f}, storage ~ {new_sf*1.2:.3f}). This estimator does "
+                f"not auto-adjust capacity because doubling SF and capacity together also doubles "
+                f"simulation cost; the decision is left to you."
             )
         else:
             reason = (
@@ -1720,7 +1955,10 @@ def print_scorecard(
         print(f"      Bus commute share:         {acs_r['bus_share']:>6.1%}")
         print(f"      Rail commute share:        {acs_r['rail_share']:>6.1%}")
         print(f"    All-trip adjustment factor:  {tc['all_trip_factor']:.2f}")
-        print(f"    Chain consistency reduction: ~{tc['chain_reduction']:.0%}")
+        cr_src = tc.get("chain_reduction_source", {})
+        print(f"    Chain consistency reduction:")
+        print(f"      Bus:  ~{tc.get('chain_reduction_bus', tc['chain_reduction']):>5.0%} ({cr_src.get('bus', 'seed')})")
+        print(f"      Rail: ~{tc.get('chain_reduction_rail', tc['chain_reduction']):>5.0%} ({cr_src.get('rail', 'seed')})")
 
         # Bus calibration
         bus = tc["bus"]
@@ -1937,11 +2175,18 @@ def main():
     api_key = config.get("data", {}).get("census_api_key", "")
 
     acs_coverage_ok = True
-    if not args.no_acs and counties and api_key:
+    if not args.no_acs and counties:
         print()
         print("-" * 70)
         print("  STEP 2: FETCHING CENSUS ACS DATA (cross-check)")
         print("-" * 70)
+        if not api_key:
+            print("  NOTE: no census_api_key in config - attempting fetch anyway.")
+            print("        The Census ACS endpoint normally requires a key; the call")
+            print("        will likely return 'Missing Key' HTML and Step 2b transit")
+            print("        calibration will be skipped. Add 'census_api_key' under")
+            print("        'data' in config.json to enable. Get a free key at:")
+            print("        https://api.census.gov/data/key_signup.html")
         print(f"  [Source: Census ACS 5-year B08301 API, year={ACS_YEAR}]")
         print(f"  Fetching commute mode data for {len(counties)} counties...")
         acs_data = fetch_acs_commute_data(counties, api_key)
@@ -1954,37 +2199,17 @@ def main():
             print(f"  !! LOW COVERAGE: only {coverage:.0%} of configured counties returned ACS data.")
             print(f"  !! Missing counties: {', '.join(missing)}")
             print(f"  !! Transit calibration will be SKIPPED to avoid mis-tuning the region")
-            print(f"  !! based on a non-representative sample. Re-run when the API is reachable,")
-            print(f"  !! or pass --no-acs to suppress this step.")
-    elif not args.no_acs and not api_key:
-        print("\n  No census_api_key in config - skipping ACS data fetch")
-        print("  Add 'census_api_key' under 'data' section to enable")
+            print(f"  !! based on a non-representative sample.")
+            if not api_key:
+                print(f"  !! ROOT CAUSE: no census_api_key in config (see NOTE above).")
+            else:
+                print(f"  !! Re-run when the API is reachable, or pass --no-acs to suppress this step.")
 
-    # --- Step 2b: Transit calibration from ACS bus/rail breakdown ---
-    transit_calibration = None
-    if acs_data and acs_coverage_ok:
-        print()
-        print("-" * 70)
-        print("  STEP 2b: TRANSIT CALIBRATION FROM ACS BUS/RAIL DATA")
-        print("-" * 70)
-        transit_calibration = compute_transit_calibration(acs_data, config)
-        if transit_calibration.get("acs_regional"):
-            acs_r = transit_calibration["acs_regional"]
-            print(f"  Regional transit share:  {acs_r['transit_share']:.1%}")
-            print(f"    Bus:  {acs_r['bus_share']:.1%}  |  Rail: {acs_r['rail_share']:.1%}")
-            print(f"  Transit calibration recommendations: "
-                  f"{len(transit_calibration['recommendations'])}")
-        else:
-            print("  No transit data available for calibration")
-
-    # --- Step 3: Load previous experiment feedback (only if --experiment-dir provided) ---
+    # --- Load previous experiment feedback up-front so Step 2b can use the
+    # empirical chain_reduction. Display of the feedback summary still happens
+    # under "STEP 3" below to keep the user-visible step order stable. ---
     experiment_feedback = None
     if args.experiment_dir:
-        print()
-        print("-" * 70)
-        print("  STEP 3: LOADING PREVIOUS EXPERIMENT RESULTS")
-        print("-" * 70)
-
         exp_dir = Path(args.experiment_dir)
         summary_file = exp_dir / "experiment_summary.json"
         if summary_file.is_file():
@@ -2002,11 +2227,51 @@ def main():
                     "experiment_dir": str(exp_dir),
                 }
             except (json.JSONDecodeError, OSError) as e:
-                print(f"  WARNING: Failed to load experiment from {exp_dir}: {e}")
-        else:
-            print(f"  WARNING: No experiment_summary.json found in {exp_dir}")
+                experiment_feedback = {"_load_error": str(e), "experiment_dir": str(exp_dir)}
 
-        if experiment_feedback:
+    empirical_chain_reduction = compute_empirical_chain_reduction(experiment_feedback)
+
+    # --- Step 2b: Transit calibration from ACS bus/rail breakdown ---
+    transit_calibration = None
+    if acs_data and acs_coverage_ok:
+        print()
+        print("-" * 70)
+        print("  STEP 2b: TRANSIT CALIBRATION FROM ACS BUS/RAIL DATA")
+        print("-" * 70)
+        transit_calibration = compute_transit_calibration(
+            acs_data, config,
+            empirical_chain_reduction=empirical_chain_reduction,
+        )
+        if transit_calibration.get("acs_regional"):
+            acs_r = transit_calibration["acs_regional"]
+            print(f"  Regional transit share:  {acs_r['transit_share']:.1%}")
+            print(f"    Bus:  {acs_r['bus_share']:.1%}  |  Rail: {acs_r['rail_share']:.1%}")
+            src = transit_calibration.get("chain_reduction_source", {})
+            cr_bus = transit_calibration.get("chain_reduction_bus")
+            cr_rail = transit_calibration.get("chain_reduction_rail")
+            if cr_bus is not None and cr_rail is not None:
+                print(f"  Chain consistency reduction:")
+                print(f"    Bus:  {cr_bus:.0%} ({src.get('bus', 'seed')})")
+                print(f"    Rail: {cr_rail:.0%} ({src.get('rail', 'seed')})")
+            print(f"  Transit calibration recommendations: "
+                  f"{len(transit_calibration['recommendations'])}")
+        else:
+            print("  No transit data available for calibration")
+
+    # --- Step 3: Display previous experiment feedback (loaded above) ---
+    if args.experiment_dir:
+        print()
+        print("-" * 70)
+        print("  STEP 3: LOADING PREVIOUS EXPERIMENT RESULTS")
+        print("-" * 70)
+
+        if experiment_feedback is None:
+            print(f"  WARNING: No experiment_summary.json found in {args.experiment_dir}")
+        elif "_load_error" in experiment_feedback:
+            print(f"  WARNING: Failed to load experiment from "
+                  f"{experiment_feedback['experiment_dir']}: {experiment_feedback['_load_error']}")
+            experiment_feedback = None
+        else:
             exp_name = Path(experiment_feedback["experiment_dir"]).name
             print(f"  Found experiment: {exp_name}")
             eval_data = experiment_feedback.get("evaluation")
@@ -2015,6 +2280,10 @@ def main():
                 print(f"  GEH < 5:      {eval_data.get('geh_lt_5_pct', 0):.1f}%")
             else:
                 print("  No evaluation data found")
+            if empirical_chain_reduction:
+                print(f"  Empirical chain_reduction recovered from prior run:")
+                for mode_name, val in empirical_chain_reduction.items():
+                    print(f"    {mode_name}: {val:.0%}")
 
     # --- Step 4: Estimate demand ---
     print()

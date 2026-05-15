@@ -2,17 +2,27 @@
 
 Calls sub-estimators in sequence:
   1. demand_estimator  — trip demand, transit config_rate, scaling factors
-  2. mode_share_estimator — MATSim scoring params from ACS transit share
+  2. mode_share_estimator — MATSim scoring + transitRouter params from ACS
+     transit share and (optionally) a prior experiment's realised mode shares
 
 Each sub-estimator writes its own log file under logs/ and updates
-config_estimated.json in the region folder. Running the orchestrator
-is equivalent to running both sub-estimators individually but with a
-single command and a combined summary at the end.
+config_estimated.json in the region folder. That JSON is the single source
+of truth: at experiment time, ConfigManager overlays its
+matsim.configurable_params onto the base MATSim template
+(matsim/configs/<mode>/config.xml). The estimators do not write any XML.
+
+Running the orchestrator is equivalent to running both sub-estimators
+individually but with a single command and a combined summary at the end.
 
 Usage:
     python estimators/estimator.py config/USA/TwinCities/config_twin.json
     python estimators/estimator.py config/USA/TwinCities/config_twin.json --no-acs
     python estimators/estimator.py config/USA/TwinCities/config_twin.json --experiment-dir E:/jetstream2_experiments/april2026/experiment_20260430_121156
+
+The --experiment-dir flag is forwarded to BOTH sub-estimators:
+  - demand_estimator uses it to load experiment_summary.json and tune demand.
+  - mode_share_estimator uses it to load modestats.csv + config.xml and
+    apply the clamped log-ratio update toward ACS targets.
 """
 
 import argparse
@@ -107,6 +117,8 @@ def main() -> None:
         extra = []
         if args.no_acs:
             extra.append("--no-acs")
+        if args.experiment_dir:
+            extra += ["--experiment-dir", args.experiment_dir]
         rc = _run(mode_share_script, args.config_file, extra)
         results["mode_share_estimator"] = "OK" if rc == 0 else f"FAILED (exit {rc})"
         if rc != 0:
@@ -126,11 +138,9 @@ def main() -> None:
     config_path = Path(args.config_file)
     stem = config_path.stem
     estimated = config_path.with_name(f"{stem}_estimated{config_path.suffix}")
-    region_xml = config_path.parent / "config.xml"
     print()
     print("  Outputs (if estimators succeeded):")
     print(f"    {estimated}")
-    print(f"    {region_xml}")
     print(f"    logs/demand_estimator_*.log")
     print(f"    logs/mode_share_estimator_*.log")
     print()
