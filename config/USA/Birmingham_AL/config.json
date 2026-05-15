@@ -1,0 +1,353 @@
+{
+  "region": {
+    "counties": [
+      "01073",
+      "01117"
+    ]
+  },
+  "data": {
+    "data_dir": "/home/exouser/Documents/twin-cities-sim/data",
+    "census_api_key": "YOUR_CENSUS_API_KEY_HERE",
+    "_census_api_key_help": "Free API key from https://api.census.gov/data/key_signup.html. Used by demand_estimator.py to fetch ACS commute data (B08301, B08303) for calibration",
+    "lodes": {
+      "year": 2023,
+      "job_type": "JT00",
+      "segment": "S000"
+    },
+    "surveys": [
+      {
+        "type": "nhts",
+        "year": "2022",
+        "file": "nhts/csv/tripv2pub.csv",
+        "weight": 1
+      }
+    ]
+  },
+  "gtfs": {
+    "catalog_url": "https://files.mobilitydatabase.org/feeds_v2.csv",
+    "catalog_max_age_days": 7,
+    "feed_max_age_days": 30,
+    "cache_dir": "data/gtfs",
+    "country_filter": "US",
+    "api_keys": {
+      "wmata.com": "YOUR_WMATA_API_KEY"
+    }
+  },
+  "modes": {
+    "car": {
+      "enabled": true,
+      "matsim_mode": "car",
+      "availability": "universal",
+      "survey_rate": "auto",
+      "config_rate": null,
+      "blend_weight": 0,
+      "share_adjustment": 0
+    },
+    "bus": {
+      "enabled": true,
+      "matsim_mode": "pt",
+      "availability": {
+        "type": "gtfs",
+        "route_types": [
+          3,
+          11
+        ],
+        "access_buffer_meters": 900
+      },
+      "survey_rate": "auto",
+      "config_rate": 0.09,
+      "blend_weight": 0.7,
+      "share_adjustment": 0
+    },
+    "rail": {
+      "enabled": false,
+      "matsim_mode": "pt",
+      "availability": {
+        "type": "gtfs",
+        "route_types": [
+          0,
+          1,
+          2,
+          12
+        ],
+        "access_buffer_meters": 1500
+      },
+      "survey_rate": "auto",
+      "config_rate": 0.06,
+      "blend_weight": 0.7,
+      "share_adjustment": 0
+    },
+    "walk": {
+      "enabled": true,
+      "matsim_mode": "walk",
+      "availability": {
+        "type": "distance",
+        "max_distance_meters": 2000
+      },
+      "survey_rate": "auto",
+      "config_rate": null,
+      "blend_weight": 0,
+      "share_adjustment": 0
+    },
+    "bike": {
+      "enabled": false,
+      "matsim_mode": "bike",
+      "availability": {
+        "type": "distance",
+        "max_distance_meters": 8000
+      },
+      "survey_rate": "auto",
+      "config_rate": null,
+      "blend_weight": 0,
+      "share_adjustment": 0
+    }
+  },
+  "mode_choice": {
+    "method": "survey_rates",
+    "fallback_mode": "car",
+    "chain_consistency": true,
+    "min_samples_per_purpose": 30,
+    "max_chain_mode_retries": 10
+  },
+  "plan_generation": {
+    "target_plans": "all",
+    "scaling_factor": 0.105,
+    "work_scaling_multiplier": 1,
+    "random_seed": 42,
+    "skip_if_exists": true,
+    "supported_chain_types": [
+      "home_work_home"
+    ],
+    "chain_sampling_method": "generated",
+    "max_chain_retries": 10,
+    "num_processes": 30,
+    "default_mode": "car"
+  },
+  "od_matrix": {
+    "alpha": 0.1,
+    "beta": 1.5,
+    "max_iterations": 200,
+    "convergence_threshold": 0.03
+  },
+  "time_models": {
+    "kde_bandwidth": "scott",
+    "max_time_retries": 10,
+    "max_duration_sample_attempts": 100
+  },
+  "duration_constraints": {
+    "activity_durations": {
+      "Work": {
+        "min_minutes": 10,
+        "max_minutes": 600,
+        "trim_priority": 1,
+        "blend_weight": 0
+      },
+      "School": {
+        "min_minutes": 10,
+        "max_minutes": 600,
+        "trim_priority": 1,
+        "blend_weight": 0
+      },
+      "Shopping": {
+        "min_minutes": 5,
+        "max_minutes": 300,
+        "trim_priority": 3,
+        "blend_weight": 0
+      },
+      "Escort": {
+        "min_minutes": 5,
+        "max_minutes": 300,
+        "trim_priority": 3,
+        "blend_weight": 0
+      },
+      "Dining": {
+        "min_minutes": 5,
+        "max_minutes": 180,
+        "trim_priority": 3,
+        "blend_weight": 0
+      },
+      "Social": {
+        "min_minutes": 10,
+        "max_minutes": 300,
+        "trim_priority": 3,
+        "blend_weight": 0
+      },
+      "Other": {
+        "min_minutes": 5,
+        "max_minutes": 300,
+        "trim_priority": 3,
+        "blend_weight": 0
+      }
+    },
+    "trip_durations": {
+      "default": {
+        "min_minutes": 1,
+        "max_minutes": 180
+      }
+    },
+    "max_travel_buffer_minutes": 180,
+    "min_evening_home_minutes": 0,
+    "trim_jitter_minutes": 15,
+    "departure_jitter_minutes": 5
+  },
+  "poi_assignment": {
+    "initial_radius_m": 2000,
+    "radius_increment_m": 1000,
+    "max_poi_retries": 10
+  },
+  "coordinates": {
+    "precision_decimal_places": 2
+  },
+  "chains": {
+    "home_boost_factor": 1,
+    "use_weighted_chains": true,
+    "max_length": null,
+    "min_length": 3,
+    "max_work_activities": 2,
+    "early_stop_exponent": 2
+  },
+  "logging": {
+    "level": "DEBUG",
+    "show_progress_bar": true,
+    "log_to_file": true,
+    "log_to_console": true,
+    "verbose": false
+  },
+  "network": {
+    "clean_network": true,
+    "rebuild_network": true
+  },
+  "matsim": {
+    "version": "matsim_25",
+    "mode": "basic",
+    "run_simulation": true,
+    "heap_size_gb": 70,
+    "transit_network": true,
+    "gtfs_sample_day": "dayWithMostTrips",
+    "pt2matsim": {
+      "numOfThreads": 4,
+      "candidateDistanceMultiplier": 1.6,
+      "maxLinkCandidateDistance": 90,
+      "maxTravelCostFactor": 5,
+      "nLinkThreshold": 6,
+      "travelCostType": "linkLength",
+      "removeNotUsedStopFacilities": true,
+      "routingWithCandidateDistance": true,
+      "scheduleFreespeedModes": "artificial"
+    },
+    "configurable_params": {
+      "coordinateSystem": "auto",
+      "lastIteration": 10,
+      "outputDirectory": "output",
+      "global.numberOfThreads": 30,
+      "qsim.numberOfThreads": 30,
+      "qsim.flowCapacityFactor": 0.1,
+      "qsim.storageCapacityFactor": 0.12,
+      "linkStats.averageLinkStatsOverIterations": 5,
+      "scoring.waitingPt": -3.0,
+      "_estimator_scoring.waitingPt": "Cold start (no prior experiment). Seeding waitingPt=-3.0 util/hr for transit density 0.43% (near-zero transit (under 1%)).",
+      "scoring.modeParams.walk.constant": -2.344,
+      "_estimator_scoring.modeParams.walk.constant": "Realised sim walk share at iter 50 = 5.01% vs. ACS target 1.35%. Deltawalk.constant = clip(0.5*ln(0.0135/0.0501), +/-1.0) = -0.657. New value: -1.687 -> -2.344.",
+      "scoring.modeParams.pt.constant": 1.109,
+      "_estimator_scoring.modeParams.pt.constant": "Realised sim PT share at iter 50 = 0.13% vs. ACS target 0.43%. Deltapt.constant = clip(0.5*ln(0.0043/0.0013), +/-1.0) = +0.601. New value: +0.508 -> +1.109."
+    }
+  },
+  "counts": {
+    "enabled": true,
+    "rebuild": false,
+    "fha": {
+      "data_dir": "data/FHA_counts",
+      "year": 2024,
+      "month": 7,
+      "weight": 1
+    },
+    "custom": {
+      "enabled": false,
+      "weight": 0
+    }
+  },
+  "evaluation": {
+    "run_evaluation": true,
+    "ground_truth_data_dir": "data/evaluation",
+    "generate_spatial_maps": true,
+    "generate_per_device_reports": true
+  },
+  "nonwork_purposes": {
+    "nonwork_trip_share": 0.8,
+    "Shopping": {
+      "enabled": true,
+      "trip_generation": {
+        "survey_rate": "auto",
+        "config_rate": 0.25,
+        "blend_weight": 0.7
+      },
+      "od_matrix": {
+        "beta": 2,
+        "alpha": 0.1
+      },
+      "poi_weighting": {
+        "enabled": true
+      }
+    },
+    "School": {
+      "enabled": true,
+      "trip_generation": {
+        "survey_rate": "auto",
+        "config_rate": 0.25,
+        "blend_weight": 0.7
+      },
+      "od_matrix": {
+        "beta": 1.8,
+        "alpha": 0.1
+      },
+      "poi_weighting": {
+        "enabled": true
+      }
+    },
+    "Social": {
+      "enabled": true,
+      "trip_generation": {
+        "survey_rate": "auto",
+        "config_rate": 0.15,
+        "blend_weight": 0.7
+      },
+      "od_matrix": {
+        "beta": 2,
+        "alpha": 0.1
+      },
+      "poi_weighting": {
+        "enabled": true
+      }
+    },
+    "Dining": {
+      "enabled": true,
+      "trip_generation": {
+        "survey_rate": "auto",
+        "config_rate": 0.15,
+        "blend_weight": 0.7
+      },
+      "od_matrix": {
+        "beta": 2,
+        "alpha": 0.1
+      },
+      "poi_weighting": {
+        "enabled": true
+      }
+    },
+    "Other": {
+      "enabled": true,
+      "trip_generation": {
+        "survey_rate": "auto",
+        "config_rate": 0.2,
+        "blend_weight": 0.7
+      },
+      "od_matrix": {
+        "beta": 2,
+        "alpha": 0.1
+      },
+      "poi_weighting": {
+        "enabled": true
+      }
+    }
+  }
+}

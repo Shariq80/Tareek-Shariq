@@ -5,7 +5,9 @@
     ]
   },
   "data": {
-    "data_dir": "/path/to/your/data",
+    "data_dir": "/home/exouser/Documents/twin-cities-sim/data",
+    "census_api_key": "YOUR_CENSUS_API_KEY_HERE",
+    "_census_api_key_help": "Free API key from https://api.census.gov/data/key_signup.html. Used by demand_estimator.py to fetch ACS commute data (B08301, B08303) for calibration",
     "lodes": {
       "year": 2023,
       "job_type": "JT00",
@@ -71,11 +73,11 @@
           11
         ],
         "_route_types_help": "GTFS route_type codes: 3=Bus, 11=Trolleybus. See GTFS spec for full list",
-        "access_buffer_meters": 900,
+        "access_buffer_meters": 1000,
         "_access_buffer_meters_help": "LA Metro bus network is less dense than Chicago but still extensive along major corridors; 900m reflects realistic walking catchment for LA's grid-arterial bus routes"
       },
       "survey_rate": "auto",
-      "config_rate": 0.09,
+      "config_rate": 0.12,
       "_config_rate_help": "LA bus share target. ACS shows ~4-5% bus commute in LA County; non-work trips are lower. Set to 0.09 pre-filtering; chain_consistency intersection will reduce to ~3-4% in output",
       "blend_weight": 0.7,
       "_blend_weight_help": "Lean heavily on config_rate since NHTS national bus share (~2%) is below LA's actual usage",
@@ -97,7 +99,7 @@
         "_access_buffer_meters_help": "LA Metro Rail stations (Red/Purple/Blue/Expo/Gold/Green lines) and Metrolink stops are spaced 1-2km apart; 1500m captures realistic catchment"
       },
       "survey_rate": "auto",
-      "config_rate": 0.06,
+      "config_rate": 0.13,
       "_config_rate_help": "LA rail share target. Metro Rail carries ~40% of LA transit riders; set to 0.06 pre-filtering; chain_consistency will reduce to ~2-3% in output",
       "blend_weight": 0.7,
       "_blend_weight_help": "Lean heavily on config_rate since NHTS national rail share (~1%) is below LA's actual usage",
@@ -117,7 +119,7 @@
       "share_adjustment": 0.0
     },
     "bike": {
-      "enabled": true,
+      "enabled": false,
       "matsim_mode": "bike",
       "availability": {
         "type": "distance",
@@ -145,7 +147,7 @@
   },
   "plan_generation": {
     "target_plans": "all",
-    "scaling_factor": 0.105,
+    "scaling_factor": 0.1,
     "work_scaling_multiplier": 1.0,
     "random_seed": 42,
     "skip_if_exists": true,
@@ -300,13 +302,27 @@
     },
     "configurable_params": {
       "coordinateSystem": "auto",
-      "lastIteration": 100,
+      "lastIteration": 10,
       "outputDirectory": "output",
       "global.numberOfThreads": 30,
       "qsim.numberOfThreads": 30,
       "qsim.flowCapacityFactor": 0.1,
       "qsim.storageCapacityFactor": 0.12,
-      "linkStats.averageLinkStatsOverIterations": 5
+      "linkStats.averageLinkStatsOverIterations": 5,
+            "scoring.modeParams.pt.constant": 1,
+      "_estimator_scoring.modeParams.pt.constant": "Cold start (no prior experiment). ACS transit share 10.70% (high-transit (10%-30%)). Seeding pt.constant=+0.5; subsequent runs with --experiment-dir will correct toward ACS using the clamped log-ratio update.",
+      "scoring.waitingPt": -1,
+      "_estimator_scoring.waitingPt": "Cold start (no prior experiment). Seeding waitingPt=-1.5 util/hr for transit density 10.70% (high-transit (10%-30%)).",
+      "scoring.modeParams.walk.constant": -3.0,
+      "_estimator_scoring.modeParams.walk.constant": "Cold start (no prior experiment). ACS walk share 3.37%. Seeding walk.constant=-2.0; subsequent runs will correct toward ACS using the clamped log-ratio update.",
+      "transitRouter.searchRadius": 1500.0,
+      "_estimator_transitRouter.searchRadius": "Cold start (no prior experiment). ACS transit share 10.70% (high transit (10%-30%)). Seeding transit-router params from tier table; subsequent runs with --experiment-dir adjust by one tier when realised PT share is outside [70%, 130%] of the ACS target. Setting searchRadius=1200.0.",
+      "transitRouter.extensionRadius": 300.0,
+      "_estimator_transitRouter.extensionRadius": "Cold start (no prior experiment). ACS transit share 10.70% (high transit (10%-30%)). Seeding transit-router params from tier table; subsequent runs with --experiment-dir adjust by one tier when realised PT share is outside [70%, 130%] of the ACS target. Setting extensionRadius=250.0.",
+      "transitRouter.maxBeelineWalkConnectionDistance": 400.0,
+      "_estimator_transitRouter.maxBeelineWalkConnectionDistance": "Cold start (no prior experiment). ACS transit share 10.70% (high transit (10%-30%)). Seeding transit-router params from tier table; subsequent runs with --experiment-dir adjust by one tier when realised PT share is outside [70%, 130%] of the ACS target. Setting maxBeelineWalkConnectionDistance=350.0.",
+      "transitRouter.directWalkFactor": 2,
+      "_estimator_transitRouter.directWalkFactor": "Cold start (no prior experiment). ACS transit share 10.70% (high transit (10%-30%)). Seeding transit-router params from tier table; subsequent runs with --experiment-dir adjust by one tier when realised PT share is outside [70%, 130%] of the ACS target. Setting directWalkFactor=1.8."
     }
   },
   "counts": {
