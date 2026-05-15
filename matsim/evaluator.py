@@ -627,6 +627,28 @@ class SimulationEvaluator:
         peak_hours = comparison_df[comparison_df['hour'].isin([6, 7, 8, 15, 16, 17])]
         peak_correlation = peak_hours[['observed', 'simulated']].corr().iloc[0, 1] if len(peak_hours) > 1 else 0.0
 
+        # Per-station sim/obs ratio (sum over hours per device).
+        # Used by demand_estimator to detect boundary-station outliers that
+        # mean_pct_error cannot distinguish from genuine demand under-counting.
+        station_ratios = []
+        station_totals = nonzero_obs.groupby('device_id')[['observed', 'simulated']].sum()
+        station_totals = station_totals[station_totals['observed'] > 0]
+        if len(station_totals) > 0:
+            ratios = (station_totals['simulated'] / station_totals['observed']).sort_values()
+            station_ratios = ratios.tolist()
+        # Interquartile mean: drop bottom & top 25% of stations, average the
+        # middle 50%. Robust to a few wildly-off boundary stations.
+        interquartile_mean_ratio = 0.0
+        median_ratio = 0.0
+        pct_stations_below_10pct = 0.0
+        if station_ratios:
+            n = len(station_ratios)
+            lo, hi = n // 4, n - n // 4
+            middle = station_ratios[lo:hi] if hi > lo else station_ratios
+            interquartile_mean_ratio = sum(middle) / len(middle)
+            median_ratio = station_ratios[n // 2]
+            pct_stations_below_10pct = sum(1 for r in station_ratios if r < 0.10) / n * 100
+
         metrics = {
             'num_devices': comparison_df['device_id'].nunique(),
             'num_comparisons': len(comparison_df),
@@ -642,6 +664,10 @@ class SimulationEvaluator:
             'geh_valid_count': int(geh_valid_count),
             'correlation': correlation,
             'peak_hour_correlation': peak_correlation,
+            'interquartile_mean_ratio': round(float(interquartile_mean_ratio), 4),
+            'median_station_ratio': round(float(median_ratio), 4),
+            'pct_stations_below_10pct': round(float(pct_stations_below_10pct), 2),
+            'num_stations_below_10pct': int(sum(1 for r in station_ratios if r < 0.10)),
             'experiment_name': self.experiment_dir.name
         }
 

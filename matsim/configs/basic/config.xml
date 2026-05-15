@@ -9,12 +9,9 @@
         <param name="overwriteFiles" value="deleteDirectoryIfExists" />
         <!--qsim-->
         <param name="mobsim" value="hermes" />
-
-        <!-- In the controller module -->
-        <!-- <param name="writeEventsInterval" value="0" /> -->
-        <!-- <param name="writePlansInterval" value="0" />
+        <param name="writeEventsInterval" value="100" />
+        <param name="writePlansInterval" value="100" />
         <param name="writeSnapshotsInterval" value="0" />
-        <param name="writeTripsInterval" value="0" /> -->
 
 
     </module>
@@ -99,9 +96,9 @@
         <param name="fractionOfIterationsToStartScoreMSA" value="0.8" />
         <parameterset type="scoringParameters">
             <!-- Per-hour disutility of waiting for PT. Default is -6 util/hr which is harsh and pushes agents off transit during MATSim re-planning; -3 is more in line with calibrated multimodal studies and lets the access/egress walk legs not dominate the PT score. -->
-            <param name="waitingPt" value="-3.0" />
+            <!-- <param name="waitingPt" value="0" /> -->
             <!-- Per-transfer disutility. Keep MATSim default; tuning this is rarely the right lever. -->
-            <param name="utilityOfLineSwitch" value="-1.0" />
+            <!-- <param name="utilityOfLineSwitch" value="0" /> -->
             <parameterset type="activityParams">
                 <param name="activityType" value="Work" />
                 <param name="minimalDuration" value="06:00:00" />
@@ -162,23 +159,26 @@
             <parameterset type="modeParams">
                 <param name="mode" value="car" />
                 <!-- Per-meter monetary cost (fuel + wear). At marginalUtilityOfMoney=1 this is ~$0.20/km. -->
-                <param name="monetaryDistanceRate" value="-0.0002" />
+                <!-- <param name="monetaryDistanceRate" value="-0.0002" /> -->
                 <!-- Daily fixed cost of car use (parking + ownership share). Keeps car attractive for long trips but discourages it for short ones, which is the asymmetry that lets PT/active win where they should. -->
-                <param name="dailyMonetaryConstant" value="-3.0" />
+                <!-- <param name="dailyMonetaryConstant" value="-3.0" /> -->
             </parameterset>
             <parameterset type="modeParams">
                 <param name="mode" value="pt" />
                 <!-- Per-trip alternative-specific constant. Default is the *base* preference;
                      per-region overrides (NYC, Chicago) bump this up via demand_estimator. -->
-                <param name="constant" value="-0.5" />
+                <!-- <param name="constant" value="3" />  -->
+                <!-- Halved from default -6.0: PT trips are longer than car for the same destination;
+                     equal in-vehicle time penalties make PT uncompetitive on suburban networks. -->
+                <!-- <param name="marginalUtilityOfTraveling_util_hr" value="-3.0" /> -->
             </parameterset>
             <parameterset type="modeParams">
                 <param name="mode" value="walk" />
                 <!-- Raised from -1.0: suppresses walk for suburban trip distances where
                      car is the realistic alternative. Distance penalty handles long walks;
                      constant handles the modal preference gap vs. car. -->
-                <param name="constant" value="-3.0" />
-                <param name="marginalUtilityOfDistance_util_m" value="-0.0006" />
+                <!-- <param name="constant" value="-3.0" /> -->
+                <!-- <param name="marginalUtilityOfDistance_util_m" value="-0.0006" /> -->
             </parameterset>
             <!-- <parameterset type="modeParams">
                 <param name="mode" value="ride" />
@@ -188,5 +188,16 @@
             </parameterset> -->
         </parameterset>
     </module>
-
+    <module name="transitRouter">
+        <!-- additional time the router allocates when a line switch happens. Can be interpreted as a 'safety' time that agents need to safely transfer from one line to another -->
+        <param name="additionalTransferTime" value="0.0" />
+        <!-- Factor with which direct walk generalized cost is multiplied before it is compared to the pt generalized cost.  Set to a very high value to reduce direct walk results. -->
+        <param name="directWalkFactor" value="1.0" />
+        <!-- step size to increase searchRadius if no stops are found -->
+        <param name="extensionRadius" value="200.0" />
+        <!-- maximum beeline distance between stops that agents could transfer to by walking -->
+        <param name="maxBeelineWalkConnectionDistance" value="100.0" />
+        <!-- the radius in which stop locations are searched, given a start or target coordinate -->
+        <param name="searchRadius" value="1000.0" />
+    </module>
 </config>
