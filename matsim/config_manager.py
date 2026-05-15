@@ -20,10 +20,13 @@ class ConfigManager:
 
         Args:
             config: Main configuration dictionary from config.json
-            config_dir: Directory containing the region's config.json.
-                If provided, get_template_path checks here for a region-specific
-                config.xml (written by mode_share_estimator) before falling back
-                to matsim/configs/{mode}/config.xml.
+            config_dir: Directory containing the region's config.json. Used by
+                _fixup_data_paths to resolve relative network/plans/transit
+                file references. NOT used for config.xml template lookup -
+                the template is always the global default at
+                matsim/configs/{mode}/config.xml. The region's JSON config
+                (specifically matsim.configurable_params) is the single
+                source of truth for per-region parameter values.
         """
         self.config = config
         self.matsim_config = config.get('matsim', {})
@@ -31,15 +34,17 @@ class ConfigManager:
 
     def get_template_path(self, mode: Optional[str] = None) -> Path:
         """
-        Get path to config template for specified mode.
+        Get path to the base MATSim config template for the specified mode.
 
-        Lookup order:
-          1. <config_dir>/config.xml  — region-specific file written by
-             mode_share_estimator (present only when the estimator has run)
-          2. matsim/configs/{mode}/config.xml  — global default
+        Per-region parameter overrides live in the region's config.json under
+        matsim.configurable_params and are applied on top of this template
+        at experiment time (see generate_config). This method intentionally
+        does NOT consult any region-specific config.xml - the JSON is the
+        single source of truth.
 
         Args:
-            mode: Simulation mode ('basic', 'uber', etc.). If None, uses config default
+            mode: Simulation mode ('basic', 'uber', etc.). If None, uses
+                  config default.
 
         Returns:
             Path to config template file
@@ -47,20 +52,11 @@ class ConfigManager:
         if mode is None:
             mode = self.matsim_config.get('mode', 'basic')
 
-        # Region-specific override takes priority
-        if self.config_dir is not None:
-            region_path = Path(self.config_dir) / 'config.xml'
-            if region_path.exists():
-                logger.info(f"Using region-specific config.xml: {region_path}")
-                return region_path
-
-        # Global fallback
         template_path = Path(__file__).parent / 'configs' / mode / 'config.xml'
-
         if not template_path.exists():
             raise FileNotFoundError(f"Config template not found: {template_path}")
 
-        logger.info(f"Using global config template: {template_path}")
+        logger.info(f"Using config template: {template_path}")
         return template_path
 
     def load_template(self, mode: Optional[str] = None) -> ET.ElementTree:
@@ -85,27 +81,52 @@ class ConfigManager:
         param_value: str
     ):
         """
-        Update a parameter value in the config XML
+        Update a parameter value in the config XML.
+
+        Raises:
+            KeyError: if the named module or param does not exist in the
+                template. This is a hard error rather than a silent warning -
+                a missing target almost always means a typo in
+                configurable_params or a base template that is out of date.
+                Add the <param> to matsim/configs/{mode}/config.xml or
+                remove the offending key from configurable_params.
 
         Args:
             tree: ElementTree object
-            module_name: Name of the module (e.g., 'global', 'controler')
+            module_name: Name of the module (e.g., 'global', 'controller')
             param_name: Name of the parameter
             param_value: New value for the parameter
         """
         root = tree.getroot()
 
-        # Find the module
+        target_module = None
         for module in root.findall('module'):
             if module.get('name') == module_name:
-                # Find the parameter
-                for param in module.findall('param'):
-                    if param.get('name') == param_name:
-                        param.set('value', str(param_value))
-                        logger.debug(f"Updated {module_name}.{param_name} = {param_value}")
-                        return
+                target_module = module
+                break
 
-        logger.warning(f"Parameter not found: {module_name}.{param_name}")
+        if target_module is None:
+            raise KeyError(
+                f"configurable_params target module not found in base "
+                f"template: <module name=\"{module_name}\"> (param "
+                f"{param_name}={param_value}). Add the module to "
+                f"matsim/configs/<mode>/config.xml or remove "
+                f"{module_name}.{param_name} from configurable_params."
+            )
+
+        for param in target_module.findall('param'):
+            if param.get('name') == param_name:
+                param.set('value', str(param_value))
+                logger.debug(f"Updated {module_name}.{param_name} = {param_value}")
+                return
+
+        raise KeyError(
+            f"configurable_params target param not found in base template: "
+            f"<param name=\"{param_name}\"> inside <module name=\"{module_name}\"> "
+            f"(value {param_value}). Add the <param> to "
+            f"matsim/configs/<mode>/config.xml or remove "
+            f"{module_name}.{param_name} from configurable_params."
+        )
 
     def update_mode_param(
         self,
@@ -229,6 +250,12 @@ class ConfigManager:
         Called when matsim.transit_network is true. Sets ``transitModes`` to the
         MATSim mode strings that agents use in their legs (e.g. ``pt``), NOT
         the config mode names (e.g. ``bus``).
+
+        If a region-specific config.xml (written by mode_share_estimator) already
+        defines transit / transitRouter modules with calibrated values, those
+        params are preserved — we only overwrite the ones we own
+        (file paths, transitModes). Default-value modules are only synthesized
+        when the loaded template has no transit/transitRouter block.
         """
         root = tree.getroot()
 
@@ -242,35 +269,61 @@ class ConfigManager:
         matsim_modes = self._get_enabled_transit_matsim_modes()
         transit_modes_str = ','.join(matsim_modes)
 
-        # Remove any existing transit/transitRouter modules (shouldn't exist, but be safe)
-        for module in list(root.findall('module')):
-            if module.get('name') in ('transit', 'transitRouter'):
-                root.remove(module)
+        def _set_param(module: ET.Element, name: str, value: str) -> None:
+            for p in module.findall('param'):
+                if p.get('name') == name:
+                    p.set('value', value)
+                    return
+            ET.SubElement(module, 'param', name=name, value=value)
 
-        # Add transit module
-        transit = ET.SubElement(root, 'module', name='transit')
-        for name, value in [
-            ('useTransit', 'true'),
-            ('transitScheduleFile', 'transitSchedule.xml'),
-            ('vehiclesFile', 'transitVehicles.xml'),
-            ('transitModes', transit_modes_str),
-        ]:
-            ET.SubElement(transit, 'param', name=name, value=value)
+        # transit module: preserve existing if present (calibrated by estimator),
+        # otherwise create from defaults. Always overwrite the params we own.
+        transit = next(
+            (m for m in root.findall('module') if m.get('name') == 'transit'),
+            None,
+        )
+        if transit is None:
+            transit = ET.SubElement(root, 'module', name='transit')
+            transit_preserved = False
+        else:
+            transit_preserved = True
+        _set_param(transit, 'useTransit', 'true')
+        _set_param(transit, 'transitScheduleFile', 'transitSchedule.xml')
+        _set_param(transit, 'vehiclesFile', 'transitVehicles.xml')
+        _set_param(transit, 'transitModes', transit_modes_str)
 
-        # Add transitRouter module
-        router = ET.SubElement(root, 'module', name='transitRouter')
-        # Kept at MATSim defaults: larger radii grow the RAPTOR candidate-stop set roughly with area (~r^2), slowing routing and inflating the transfer graph's memory footprint on large scenarios.
-        for name, value in [
-            ('additionalTransferTime', '0.0'),
-            ('directWalkFactor', '1.0'),
-            ('extensionRadius', '200.0'),
-            ('maxBeelineWalkConnectionDistance', '100.0'),
-            ('searchRadius', '1000.0'),
-        ]:
-            ET.SubElement(router, 'param', name=name, value=value)
+        # transitRouter module: same policy. Defaults are only seeded when the
+        # template has no transitRouter block at all; otherwise the region's
+        # tuned values (extensionRadius, searchRadius, etc.) are kept.
+        router = next(
+            (m for m in root.findall('module') if m.get('name') == 'transitRouter'),
+            None,
+        )
+        if router is None:
+            router = ET.SubElement(root, 'module', name='transitRouter')
+            for name, value in [
+                ('additionalTransferTime', '0.0'),
+                ('directWalkFactor', '1.0'),
+                ('extensionRadius', '200.0'),
+                ('maxBeelineWalkConnectionDistance', '100.0'),
+                ('searchRadius', '1000.0'),
+            ]:
+                ET.SubElement(router, 'param', name=name, value=value)
+            router_preserved = False
+        else:
+            router_preserved = True
 
+        preserved_bits = []
+        if transit_preserved:
+            preserved_bits.append("transit")
+        if router_preserved:
+            preserved_bits.append("transitRouter")
+        preserved_note = (
+            f" (preserved existing params on: {', '.join(preserved_bits)})"
+            if preserved_bits else ""
+        )
         logger.info(f"Enabled transit module with transitModes={transit_modes_str} "
-                     f"(from enabled modes: {transit_mode_names})")
+                    f"(from enabled modes: {transit_mode_names}){preserved_note}")
 
     def generate_config(
         self,
@@ -385,6 +438,13 @@ class ConfigManager:
         if custom_params:
             for module_param, value in custom_params.items():
                 if '.' not in module_param:
+                    continue
+                # Skip estimator-generated annotation keys. These mirror the
+                # filter in the configurable_params loop above; without it,
+                # the strict update_parameter raises KeyError on the bogus
+                # "_estimator_<leaf>" module names that demand_estimator and
+                # mode_share_estimator attach as reason strings.
+                if module_param.startswith('_estimator_') or module_param.startswith('_info'):
                     continue
                 parts = module_param.split('.')
                 if parts[0] == 'scoring' and len(parts) >= 4 and parts[1] == 'modeParams':

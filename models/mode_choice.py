@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 
 from models.mode_types import ModeType, ModeConfig, get_default_car_config, MODE_CAR
-from models.mode_availability import ModeAvailabilityManager, Location
+from models.mode_availability import ModeAvailabilityManager, Location, haversine_meters
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +103,14 @@ class ModeChoiceModel:
         self.chain_consistency = mode_choice_config.get('chain_consistency', True)
         self.min_samples_per_purpose = mode_choice_config.get('min_samples_per_purpose', 30)
         self.max_chain_mode_retries = mode_choice_config.get('max_chain_mode_retries', 5)
+        # Short legs (e.g. Work->Lunch) get a walk pass-through: they don't
+        # constrain the chain intersection, and emit as walk regardless of the
+        # chain's primary mode. Only applies to interior legs (neither
+        # endpoint is Home). 0 disables. Default 800m matches the typical
+        # 10-minute-walk definition used in urban planning.
+        self.walk_passthrough_max_meters = float(
+            mode_choice_config.get('walk_passthrough_max_meters', 200.0)
+        )
 
         # Store survey data for rate computation
         self.survey_data = survey_data
@@ -123,6 +131,28 @@ class ModeChoiceModel:
             'purposes_with_fallback': set(),
             'chain_mode_selections': {},  # {(mode, purpose, num_legs): count}
             'chain_availability': {},     # {frozenset(modes): count}
+
+            # --- Chain-consistency diagnostics ---
+            # Per-mode count of legs where the mode was available on that leg.
+            # Compared against `mode_eligible_after_intersection` to quantify
+            # how much each mode is being filtered out by chain consistency.
+            'mode_eligible_per_leg': {mt: 0 for mt in ModeType},
+            # Per-mode count of chains where the mode survived the intersection.
+            # Multiplied by chain length to make it leg-comparable.
+            'mode_eligible_after_intersection': {mt: 0 for mt in ModeType},
+            # Per-mode count of chains where the mode was eligible on EVERY
+            # leg individually but was knocked out by walk-pass-through being
+            # disabled would have helped. Tracks the chain-consistency leak.
+            'mode_lost_to_chain_consistency': {mt: 0 for mt in ModeType},
+            # Distribution of chain lengths actually seen.
+            'chain_length_counts': {},  # {num_legs: count}
+            # Walk-pass-through usage.
+            'walk_passthrough_legs': 0,
+            'walk_passthrough_chains': 0,
+            # Retry telemetry.
+            'chain_retry_attempts': 0,
+            'chain_retry_succeeded': 0,
+            'chain_retry_exhausted': 0,
         }
 
         logger.info(f"ModeChoiceModel initialized with {len(self.mode_configs)} modes: "
@@ -413,9 +443,17 @@ class ModeChoiceModel:
 
         For n activities, there are n-1 legs (trips between activities).
 
-        With chain_consistency=True, the entire chain uses the same mode.
-        If the chosen mode isn't available for all legs, we retry with a
-        different mode (up to max_chain_mode_retries times).
+        With chain_consistency=True, the entire chain uses one "primary" mode.
+        Short legs (haversine distance below `walk_passthrough_max_meters`)
+        are exempt from the chain-mode constraint: they are NOT used to
+        constrain the chain intersection (a midday Work->Lunch leg won't
+        knock PT or car out of the chain) and they are emitted as walk
+        regardless of the primary mode (you don't drive 300m to lunch).
+
+        If `final_rates` ends up empty after filtering and renormalisation
+        (rare - e.g. dominant_purpose has zero survey mass on every available
+        mode), we re-sample using the overall 'all' rates as a retry, up to
+        `max_chain_mode_retries` times, before falling back to fallback_mode.
 
         Args:
             activities: List of Activity objects (must have 'type' attribute)
@@ -429,6 +467,9 @@ class ModeChoiceModel:
             return []
 
         num_legs = len(activities) - 1
+        self.stats['chain_length_counts'][num_legs] = (
+            self.stats['chain_length_counts'].get(num_legs, 0) + 1
+        )
 
         if rng is None:
             rng = np.random.default_rng()
@@ -444,50 +485,155 @@ class ModeChoiceModel:
                 modes.append(mode)
             return modes
 
-        # Chain consistency: entire chain uses same mode
-        # Get available modes for ALL legs
-        available_for_all: Optional[Set[ModeType]] = None
-
+        # --- Chain consistency path ---
+        # First pass: per-leg availability + walk-pass-through classification.
+        #
+        # Walk-pass-through is intended for short INTERIOR legs of a subtour
+        # (e.g. Work->Lunch in Home->Work->Lunch->Work->Home), not for the
+        # primary commute legs that bookend the chain. A leg is eligible
+        # for walk-pass only if NEITHER of its endpoints is a Home activity:
+        # otherwise short Home->Work commutes get auto-converted to walk
+        # regardless of survey mode shares, which inflates walk share well
+        # beyond what the survey supports.
+        leg_available_sets: List[Set[ModeType]] = []
+        is_short_leg: List[bool] = []
         for i in range(num_legs):
             origin = locations[i]
             destination = locations[i + 1]
             leg_available = self.availability_manager.get_available_modes(origin, destination)
+            leg_available_sets.append(leg_available)
+            for mt in leg_available:
+                self.stats['mode_eligible_per_leg'][mt] = (
+                    self.stats['mode_eligible_per_leg'].get(mt, 0) + 1
+                )
 
-            if available_for_all is None:
-                available_for_all = leg_available.copy()
-            else:
-                available_for_all &= leg_available  # Intersection
+            short = False
+            if self.walk_passthrough_max_meters > 0:
+                origin_type = getattr(activities[i], 'type', None)
+                dest_type = getattr(activities[i + 1], 'type', None)
+                is_interior = origin_type != 'Home' and dest_type != 'Home'
+                if is_interior:
+                    dist_m = haversine_meters(
+                        origin.lat, origin.lon, destination.lat, destination.lon
+                    )
+                    short = dist_m <= self.walk_passthrough_max_meters
+            is_short_leg.append(short)
+
+        # Intersect availability across only the LONG legs (short legs get a
+        # walk pass and don't constrain the chain mode).
+        long_leg_indices = [i for i, s in enumerate(is_short_leg) if not s]
+        if long_leg_indices:
+            available_for_all: Set[ModeType] = leg_available_sets[long_leg_indices[0]].copy()
+            for i in long_leg_indices[1:]:
+                available_for_all &= leg_available_sets[i]
+        else:
+            # All legs are short - union over per-leg availability is fine,
+            # since each leg will be emitted as walk anyway. Pick walk if
+            # available, otherwise any mode (sampling will pick one).
+            available_for_all = set()
+            for s in leg_available_sets:
+                available_for_all |= s
+
+        # Diagnostics: for each mode, was it eligible on every long leg
+        # individually (i.e. survived the intersection)? And: did walk-pass
+        # rescue it from a short leg that would otherwise have filtered it?
+        any_short = any(is_short_leg)
+        if any_short:
+            self.stats['walk_passthrough_chains'] += 1
+            self.stats['walk_passthrough_legs'] += sum(is_short_leg)
+
+        # Compare full intersection (all legs, no walk-pass) vs. long-leg
+        # intersection to count modes "saved" by walk-pass-through.
+        full_intersect: Set[ModeType] = leg_available_sets[0].copy()
+        for s in leg_available_sets[1:]:
+            full_intersect &= s
+        rescued_modes = available_for_all - full_intersect
+        for mt in rescued_modes:
+            self.stats['mode_lost_to_chain_consistency'][mt] = (
+                self.stats['mode_lost_to_chain_consistency'].get(mt, 0) + 1
+            )
+        for mt in available_for_all:
+            self.stats['mode_eligible_after_intersection'][mt] = (
+                self.stats['mode_eligible_after_intersection'].get(mt, 0) + 1
+            )
 
         if not available_for_all:
             logger.warning("No mode available for all legs in chain, using fallback for each leg")
             self.stats['fallback_used'] += 1
-            return [self.fallback_mode] * num_legs
+            return self._emit_chain_modes(self.fallback_mode, is_short_leg, leg_available_sets)
 
-        # Track availability combinations for summary
+        # Track availability combinations for summary.
         avail_key = frozenset(m.value for m in available_for_all)
         self.stats['chain_availability'][avail_key] = self.stats['chain_availability'].get(avail_key, 0) + 1
 
-        # Get the dominant purpose for mode choice (use first non-Home activity)
+        # Get the dominant purpose for mode choice (use first non-Home activity).
         dominant_purpose = None
-        for act in activities[1:]:  # Skip first (usually Home)
+        for act in activities[1:]:
             act_type = getattr(act, 'type', None)
             if act_type and act_type != 'Home':
                 dominant_purpose = act_type
                 break
 
-        # Get rates and filter to modes available for all legs
-        base_rates = self._get_base_rates(dominant_purpose)
-        adjusted_rates = self._apply_rate_adjustments(base_rates)
-        final_rates = self._filter_and_renormalize(adjusted_rates, available_for_all)
+        # Sample chain mode, with retry if filter+renormalise yields empty rates.
+        chain_mode: Optional[ModeType] = None
+        purposes_to_try = [dominant_purpose, 'all'] if dominant_purpose else ['all']
+        attempts = 0
+        for purpose_attempt in purposes_to_try:
+            if attempts >= self.max_chain_mode_retries:
+                break
+            attempts += 1
+            if attempts > 1:
+                self.stats['chain_retry_attempts'] += 1
+            base_rates = self._get_base_rates(purpose_attempt)
+            adjusted_rates = self._apply_rate_adjustments(base_rates)
+            final_rates = self._filter_and_renormalize(adjusted_rates, available_for_all)
+            if final_rates and sum(final_rates.values()) > 0:
+                chain_mode = self._sample_mode(final_rates, rng)
+                # _sample_mode bumps mode_samples once; back it out so the
+                # per-leg accounting in _emit_chain_modes is the single source
+                # of truth for chain paths. (choose_mode still relies on the
+                # _sample_mode bump for single-trip callers.)
+                self.stats['mode_samples'][chain_mode] -= 1
+                if attempts > 1:
+                    self.stats['chain_retry_succeeded'] += 1
+                break
 
-        # Sample mode for the entire chain
-        chain_mode = self._sample_mode(final_rates, rng)
+        if chain_mode is None:
+            # All retry attempts produced empty rates - pick uniformly from
+            # the available set as a last resort before fallback.
+            self.stats['chain_retry_exhausted'] += 1
+            if available_for_all:
+                avail_sorted = sorted(available_for_all, key=lambda m: m.value)
+                chain_mode = avail_sorted[int(rng.integers(0, len(avail_sorted)))]
+            else:
+                chain_mode = self.fallback_mode
+                self.stats['fallback_used'] += 1
 
-        # Track chain mode selections for summary
+        # Track chain mode selections for summary.
         sel_key = (chain_mode.value, dominant_purpose, num_legs)
         self.stats['chain_mode_selections'][sel_key] = self.stats['chain_mode_selections'].get(sel_key, 0) + 1
 
-        return [chain_mode] * num_legs
+        return self._emit_chain_modes(chain_mode, is_short_leg, leg_available_sets)
+
+    def _emit_chain_modes(self, chain_mode: ModeType,
+                          is_short_leg: List[bool],
+                          leg_available_sets: List[Set[ModeType]]) -> List[ModeType]:
+        """Emit per-leg modes from a primary chain mode, applying walk-pass-through.
+
+        Short legs emit as WALK if walk is available on that leg; otherwise
+        they emit as the chain mode (e.g. walk disabled in config). Long
+        legs always emit as the chain mode - by construction they're in
+        the chain intersection.
+        """
+        modes: List[ModeType] = []
+        for i, short in enumerate(is_short_leg):
+            if short and ModeType.WALK in leg_available_sets[i]:
+                modes.append(ModeType.WALK)
+                self.stats['mode_samples'][ModeType.WALK] += 1
+            else:
+                modes.append(chain_mode)
+                self.stats['mode_samples'][chain_mode] += 1
+        return modes
 
     def get_output_mode(self, mode_type: ModeType, output_format: str = 'matsim') -> str:
         """
@@ -556,6 +702,25 @@ class ModeChoiceModel:
             key = ', '.join(sorted(modes_set))
             avail_summary[key] = avail_summary.get(key, 0) + count
 
+        # Chain-consistency diagnostics: per-mode eligibility leak.
+        # leak_pct = (eligible per-leg basis - eligible after intersection) /
+        #             eligible per-leg basis. The "per-leg basis" is the count
+        #             of legs where the mode was individually available; the
+        #             intersection count is per-chain (one per chain), so we
+        #             multiply each chain by its length to compare. Since
+        #             chain_availability tracks unique (frozenset, count)
+        #             pairs we approximate using mode_eligible_after_intersection
+        #             (chain count, not leg count).
+        eligible_per_leg = {
+            k.value: v for k, v in self.stats['mode_eligible_per_leg'].items() if v > 0
+        }
+        eligible_after_intersect = {
+            k.value: v for k, v in self.stats['mode_eligible_after_intersection'].items() if v > 0
+        }
+        rescued_by_walk = {
+            k.value: v for k, v in self.stats['mode_lost_to_chain_consistency'].items() if v > 0
+        }
+
         return {
             'total_mode_choices': total_samples,
             'mode_distribution': mode_distribution,
@@ -565,6 +730,16 @@ class ModeChoiceModel:
             'chain_selections_by_mode': chain_by_mode,
             'chain_selections_by_purpose': chain_by_purpose,
             'chain_availability_combos': avail_summary,
+            # New diagnostics
+            'mode_eligible_per_leg': eligible_per_leg,
+            'mode_eligible_chains_after_intersection': eligible_after_intersect,
+            'mode_rescued_by_walk_passthrough_chains': rescued_by_walk,
+            'chain_length_counts': dict(self.stats['chain_length_counts']),
+            'walk_passthrough_legs': self.stats['walk_passthrough_legs'],
+            'walk_passthrough_chains': self.stats['walk_passthrough_chains'],
+            'chain_retry_attempts': self.stats['chain_retry_attempts'],
+            'chain_retry_succeeded': self.stats['chain_retry_succeeded'],
+            'chain_retry_exhausted': self.stats['chain_retry_exhausted'],
         }
 
     def log_stats_summary(self) -> None:
@@ -599,5 +774,41 @@ class ModeChoiceModel:
             logger.info("  Mode availability combinations across chains:")
             for combo, count in sorted(stats['chain_availability_combos'].items(), key=lambda x: -x[1]):
                 logger.info(f"    [{combo}]: {count} chains")
+
+        # --- Chain-consistency diagnostics ---
+        chain_lengths = stats.get('chain_length_counts') or {}
+        if chain_lengths:
+            logger.info("  Chain length distribution (legs per chain):")
+            for length, count in sorted(chain_lengths.items()):
+                logger.info(f"    {length}-leg chains: {count}")
+
+        per_leg = stats.get('mode_eligible_per_leg') or {}
+        per_chain = stats.get('mode_eligible_chains_after_intersection') or {}
+        if per_leg:
+            logger.info("  Per-mode eligibility (chain-consistency leak):")
+            logger.info("    mode: eligible_legs / chains_surviving_intersection")
+            for mode in sorted(per_leg.keys()):
+                legs = per_leg.get(mode, 0)
+                chains = per_chain.get(mode, 0)
+                logger.info(f"    {mode}: {legs} eligible legs, {chains} chains survived")
+
+        rescued = stats.get('mode_rescued_by_walk_passthrough_chains') or {}
+        if rescued:
+            logger.info("  Modes rescued by walk-pass-through (chains where short")
+            logger.info("  legs would otherwise have filtered the mode out):")
+            for mode, count in sorted(rescued.items(), key=lambda x: -x[1]):
+                logger.info(f"    {mode}: rescued in {count} chains")
+
+        wp_legs = stats.get('walk_passthrough_legs', 0)
+        wp_chains = stats.get('walk_passthrough_chains', 0)
+        if wp_legs or wp_chains:
+            logger.info(f"  Walk-pass-through: {wp_legs} short legs across "
+                       f"{wp_chains} chains emitted as walk")
+
+        retry_att = stats.get('chain_retry_attempts', 0)
+        if retry_att:
+            logger.info(f"  Chain mode retries: {retry_att} attempts, "
+                       f"{stats.get('chain_retry_succeeded', 0)} succeeded, "
+                       f"{stats.get('chain_retry_exhausted', 0)} exhausted")
 
         logger.info("=" * 50)

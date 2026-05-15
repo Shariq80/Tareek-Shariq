@@ -294,6 +294,66 @@ def _count_stuck_events(events_path: Path) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Demand-side leg mode breakdown (from plans.xml)
+# ---------------------------------------------------------------------------
+
+# Match `<leg mode="..."` anywhere on a line. Plans are pretty-printed so
+# legs land on their own line, but be tolerant of single-line files too.
+_LEG_MODE_RE = re.compile(r'<leg\b[^>]*\bmode="([^"]+)"')
+
+
+def build_generated_plans_modes_section(experiment_dir: Path) -> Optional[Dict]:
+    """
+    Demand-side leg counts by mode, parsed from plans.xml.
+
+    This is what plan generation emitted BEFORE MATSim ran any iterations -
+    i.e. the mode shares produced by ModeChoiceModel. Use the matsim_output
+    section's transit/legs counts for the realised post-replanning shares.
+
+    Streams the file line-by-line with a regex - plans.xml is pretty-printed
+    one element per line, and the file is plain text (not gzipped). Memory
+    is flat regardless of file size.
+
+    Returns None if plans.xml is missing.
+    """
+    plans_path = experiment_dir / 'plans.xml'
+    if not plans_path.exists():
+        return None
+
+    counts: Dict[str, int] = {}
+    try:
+        with open(plans_path, 'r', encoding='utf-8', errors='replace') as f:
+            for line in f:
+                if '<leg' not in line:
+                    continue
+                m = _LEG_MODE_RE.search(line)
+                if m:
+                    mode = m.group(1)
+                    counts[mode] = counts.get(mode, 0) + 1
+    except OSError as e:
+        logger.warning(f"Could not read plans.xml: {e}")
+        return None
+
+    total = sum(counts.values())
+    if total == 0:
+        return None
+
+    shares_pct = {m: round(n / total * 100, 2) for m, n in counts.items()}
+    return {
+        '_comment': 'Generated-leg counts by mode, parsed from plans.xml. '
+                   'These are the demand-side shares produced by ModeChoiceModel '
+                   'BEFORE MATSim replanning. For realised post-simulation shares '
+                   'see matsim_output (output_legs_count, transit.pt_legs_total).',
+        'counts': counts,
+        'counts_comment': 'Number of legs per mode summed across all generated plans',
+        'shares_pct': shares_pct,
+        'shares_pct_comment': 'Mode shares as percentages of total legs. Sums to ~100.',
+        'total_legs': total,
+        'total_legs_comment': 'Total legs across all generated plans (all purposes)',
+    }
+
+
+# ---------------------------------------------------------------------------
 # Public-transit sub-mode breakdown
 # ---------------------------------------------------------------------------
 #
@@ -629,6 +689,25 @@ def build_summary(
     plans_dict = {'work': get_plan_count(plan_stats.get('work'))}
     for purpose_key in nonwork_purpose_keys:
         plans_dict[purpose_key] = get_plan_count(plan_stats.get(purpose_key))
+
+    # Aggregate mode_choice stats across purposes (trip-weighted) so the
+    # demand estimator can recover empirical chain_reduction on the next run.
+    mode_choice_counts: Dict[str, int] = {}
+    total_mode_choices = 0
+    purpose_keys_all = ['work'] + nonwork_purpose_keys
+    for pk in purpose_keys_all:
+        mc = (plan_stats.get(pk) or {}).get('mode_choice') or {}
+        n = mc.get('total_mode_choices', 0) or 0
+        dist = mc.get('mode_distribution') or {}
+        if n <= 0 or not dist:
+            continue
+        total_mode_choices += n
+        for mode_name, share in dist.items():
+            mode_choice_counts[mode_name] = mode_choice_counts.get(mode_name, 0) + share * n
+    mode_distribution = {
+        k: round(v / total_mode_choices, 6)
+        for k, v in mode_choice_counts.items()
+    } if total_mode_choices > 0 else {}
     plans_dict.update({
         'total': total_generated,
         'success_rate': overall_success_rate,
@@ -705,6 +784,26 @@ def build_summary(
             'storage_capacity_factor': matsim_params.get('qsim.storageCapacityFactor'),
             'storage_capacity_factor_comment': 'MATSim QSim storage capacity scaling. Should be >= flow_capacity_factor. '
                                               'Controls how many vehicles can be on a link simultaneously.',
+            'modes': {
+                mode_name: {
+                    'config_rate': (config.get('modes', {}).get(mode_name, {}) or {}).get('config_rate'),
+                    'blend_weight': (config.get('modes', {}).get(mode_name, {}) or {}).get('blend_weight'),
+                }
+                for mode_name in ('bus', 'rail')
+            },
+            'modes_comment': 'Snapshot of config.modes.{bus,rail}.{config_rate,blend_weight} used '
+                             'for this run. Demand estimator reads this together with '
+                             'mode_choice.mode_distribution to back-calculate empirical '
+                             'chain_reduction for the next run.',
+        },
+
+        'mode_choice': {
+            '_comment': 'Mode-choice outputs aggregated across all purposes (trip-weighted). '
+                        'Used by the demand estimator to derive empirical chain_reduction.',
+            'total_mode_choices': total_mode_choices,
+            'mode_distribution': mode_distribution,
+            'mode_distribution_comment': 'Share of legs assigned to each mode across all '
+                                         'generated plans, weighted by purpose volume.',
         },
 
         'data_quality': {
@@ -758,6 +857,10 @@ def build_summary(
         'simulation_status_comment': 'Final status: completed, failed, or skipped',
     }
 
+    plan_modes_section = build_generated_plans_modes_section(experiment_dir)
+    if plan_modes_section is not None:
+        summary['generated_plans_modes'] = plan_modes_section
+
     matsim_section = build_matsim_output_section(experiment_dir)
     if matsim_section is not None:
         summary['matsim_output'] = matsim_section
@@ -792,7 +895,21 @@ def _build_evaluation_section(evaluation_metrics: Dict) -> Dict:
                        'RMSE = sqrt(mean((simulated - observed)^2))',
         'mean_pct_error': round(evaluation_metrics.get('mean_pct_error', 0), 2),
         'mean_pct_error_comment': 'Mean percentage error: mean((simulated - observed) / observed * 100). '
-                                 'Negative = underestimating traffic, Positive = overestimating traffic.',
+                                 'Negative = underestimating traffic, Positive = overestimating traffic. '
+                                 'Sensitive to boundary stations with through-traffic from outside the modeled '
+                                 'area; prefer interquartile_mean_ratio for calibration decisions.',
+        'interquartile_mean_ratio': evaluation_metrics.get('interquartile_mean_ratio', 0),
+        'interquartile_mean_ratio_comment': 'Interquartile mean of per-station sim/obs total-volume ratios. '
+                                            'Drops bottom & top 25% of stations and averages the middle 50%. '
+                                            'Robust to boundary stations; 1.0 = perfect, <0.7 = under-simulation. '
+                                            'Used as the primary signal for demand_estimator scaling-factor decisions.',
+        'median_station_ratio': evaluation_metrics.get('median_station_ratio', 0),
+        'median_station_ratio_comment': 'Median of per-station sim/obs ratios. Companion to interquartile_mean_ratio.',
+        'pct_stations_below_10pct': evaluation_metrics.get('pct_stations_below_10pct', 0),
+        'pct_stations_below_10pct_comment': 'Percent of count stations whose simulated total is below 10% of observed. '
+                                            'High values indicate boundary stations capturing through-traffic from '
+                                            'outside the modeled region (cannot be fixed by raising demand).',
+        'num_stations_below_10pct': evaluation_metrics.get('num_stations_below_10pct', 0),
     }
 
 
@@ -807,10 +924,10 @@ def write_summary(summary: Dict, summary_path: Path) -> None:
 
 def refresh_matsim_output(experiment_dir: Path) -> Path:
     """
-    Read existing experiment_summary.json, recompute the matsim_output section
-    from disk, and write back. Other sections are preserved as-is because
-    they are not reconstructable post-hoc (live timers, in-memory plan-gen
-    counters, etc.).
+    Read existing experiment_summary.json, recompute the matsim_output and
+    generated_plans_modes sections from disk, and write back. Other sections
+    are preserved as-is because they are not reconstructable post-hoc (live
+    timers, in-memory plan-gen counters, etc.).
 
     Returns the path of the refreshed summary file.
     """
@@ -830,6 +947,16 @@ def refresh_matsim_output(experiment_dir: Path) -> Path:
     else:
         summary['matsim_output'] = matsim_section
         summary['matsim_output_refreshed_at'] = datetime.now().isoformat()
+
+    plan_modes_section = build_generated_plans_modes_section(experiment_dir)
+    if plan_modes_section is not None:
+        summary['generated_plans_modes'] = plan_modes_section
+
+    # Drop legacy section names superseded by current schema. Older runs
+    # wrote `legs_by_mode` (in-memory aggregation, since removed in favour
+    # of the plans.xml-based `generated_plans_modes`). Refresh removes it
+    # so summaries don't carry stale or empty sections forward.
+    summary.pop('legs_by_mode', None)
 
     write_summary(summary, summary_path)
     return summary_path
