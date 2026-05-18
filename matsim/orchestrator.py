@@ -45,7 +45,11 @@ class MATSimOrchestrator:
                 self.config = json.load(f)
 
         self.network_generator = NetworkGenerator(self.config)
-        self.config_manager = ConfigManager(self.config)
+        config_dir = self.config.get("_config_dir")
+        self.config_manager = ConfigManager(
+            self.config,
+            config_dir=Path(config_dir) if config_dir else None,
+        )
         self.runner = MATSimRunner(self.config)
 
         logger.info("MATSim Orchestrator initialized")

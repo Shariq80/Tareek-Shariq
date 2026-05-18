@@ -627,6 +627,28 @@ class SimulationEvaluator:
         peak_hours = comparison_df[comparison_df['hour'].isin([6, 7, 8, 15, 16, 17])]
         peak_correlation = peak_hours[['observed', 'simulated']].corr().iloc[0, 1] if len(peak_hours) > 1 else 0.0
 
+        # Per-station sim/obs ratio (sum over hours per device).
+        # Used by demand_estimator to detect boundary-station outliers that
+        # mean_pct_error cannot distinguish from genuine demand under-counting.
+        station_ratios = []
+        station_totals = nonzero_obs.groupby('device_id')[['observed', 'simulated']].sum()
+        station_totals = station_totals[station_totals['observed'] > 0]
+        if len(station_totals) > 0:
+            ratios = (station_totals['simulated'] / station_totals['observed']).sort_values()
+            station_ratios = ratios.tolist()
+        # Interquartile mean: drop bottom & top 25% of stations, average the
+        # middle 50%. Robust to a few wildly-off boundary stations.
+        interquartile_mean_ratio = 0.0
+        median_ratio = 0.0
+        pct_stations_below_10pct = 0.0
+        if station_ratios:
+            n = len(station_ratios)
+            lo, hi = n // 4, n - n // 4
+            middle = station_ratios[lo:hi] if hi > lo else station_ratios
+            interquartile_mean_ratio = sum(middle) / len(middle)
+            median_ratio = station_ratios[n // 2]
+            pct_stations_below_10pct = sum(1 for r in station_ratios if r < 0.10) / n * 100
+
         metrics = {
             'num_devices': comparison_df['device_id'].nunique(),
             'num_comparisons': len(comparison_df),
@@ -642,6 +664,10 @@ class SimulationEvaluator:
             'geh_valid_count': int(geh_valid_count),
             'correlation': correlation,
             'peak_hour_correlation': peak_correlation,
+            'interquartile_mean_ratio': round(float(interquartile_mean_ratio), 4),
+            'median_station_ratio': round(float(median_ratio), 4),
+            'pct_stations_below_10pct': round(float(pct_stations_below_10pct), 2),
+            'num_stations_below_10pct': int(sum(1 for r in station_ratios if r < 0.10)),
             'experiment_name': self.experiment_dir.name
         }
 
@@ -786,8 +812,103 @@ class SimulationEvaluator:
             plot_path = self.evaluation_dir / 'spatial_overview.png'
             plt.savefig(plot_path, dpi=300, bbox_inches='tight', pad_inches=0.1)
             logger.info(f"Saved spatial overview to {plot_path}")
+            plt.close(fig)
+
+        self.plot_hourly_pct_error_maps(matched_devices, comparison_df, hours=[7, 8, 15, 16], save=save)
 
         return fig
+
+    def plot_hourly_pct_error_maps(self, matched_devices: pd.DataFrame, comparison_df: pd.DataFrame,
+                                    hours: list = None, save: bool = True):
+        """
+        Create per-hour spatial maps showing % error (sim vs observed) at each count station.
+
+        Stations are colored green/yellow/red by absolute % error magnitude.
+        Each requested hour produces one PNG: count_error_h{hour}.png
+        """
+        if self.network_links is None or self.link_geometries is None:
+            logger.warning("Network not loaded, cannot generate hourly pct-error maps")
+            return
+
+        if hours is None:
+            hours = [7, 8, 17, 18]
+
+        # Pre-build network segments once
+        segments = [
+            [(row['from_x'], row['from_y']), (row['to_x'], row['to_y'])]
+            for _, row in self.network_links.iterrows()
+        ]
+
+        for hour in hours:
+            hour_df = comparison_df[comparison_df['hour'] == hour].copy()
+            if hour_df.empty:
+                logger.warning(f"No comparison data for hour {hour}, skipping")
+                continue
+
+            # Merge device locations with this hour's pct_error
+            hour_devices = matched_devices.merge(
+                hour_df[['device_id', 'observed', 'simulated', 'pct_error']],
+                left_on='LOCAL_ID', right_on='device_id', how='inner'
+            )
+
+            fig, ax = plt.subplots(figsize=(14, 12))
+            ax.set_title(
+                f'Count Station % Error — Hour {hour:02d}:00  |  {self.experiment_dir.name}',
+                fontsize=15, fontweight='bold'
+            )
+
+            # Gray network background
+            lc = LineCollection(segments, colors='#9D9C9C', linewidths=0.8, alpha=0.5)
+            ax.add_collection(lc)
+            self._draw_county_boundaries(ax)
+
+            # Plot each device colored AND shaped by |pct_error| (readable in B&W)
+            # Good=circle/green, Acceptable=square/yellow, Poor=triangle/red
+            # N/A (observed=0) treated as Poor
+            _tier_style = {
+                'good':       ('#2ECC40', 'o'),
+                'acceptable': ('#FFDC00', 's'),
+                'poor':       ('#FF4136', '^'),
+            }
+            for _, dev in hour_devices.iterrows():
+                pct = dev.get('pct_error', np.nan)
+                if pd.isna(pct):
+                    color, marker = _tier_style['poor']
+                else:
+                    abs_pct = abs(pct)
+                    if abs_pct <= 15:
+                        color, marker = _tier_style['good']
+                    elif abs_pct <= 30:
+                        color, marker = _tier_style['acceptable']
+                    else:
+                        color, marker = _tier_style['poor']
+
+                ax.scatter(dev['utm_x'], dev['utm_y'], c=color, s=40,
+                           marker=marker, edgecolors='black', linewidths=0.8, zorder=5)
+
+            ax.set_aspect('equal')
+            ax.set_xlabel('UTM X (m)')
+            ax.set_ylabel('UTM Y (m)')
+            ax.grid(True, alpha=0.3)
+
+            from matplotlib.lines import Line2D
+            legend_elements = [
+                Line2D([0], [0], marker='o', color='w', markerfacecolor='#2ECC40',
+                       markeredgecolor='black', markersize=7, label='|% error| ≤ 15%  (Good)'),
+                Line2D([0], [0], marker='s', color='w', markerfacecolor='#FFDC00',
+                       markeredgecolor='black', markersize=7, label='|% error| 15–30%  (Acceptable)'),
+                Line2D([0], [0], marker='^', color='w', markerfacecolor='#FF4136',
+                       markeredgecolor='black', markersize=7, label='|% error| > 30% or no data  (Poor)'),
+                mpatches.Patch(facecolor='none', edgecolor='blue', linestyle='--',
+                               linewidth=2, label='County Boundary'),
+            ]
+            ax.legend(handles=legend_elements, loc='upper right', framealpha=0.9, fontsize=9)
+
+            if save:
+                plot_path = self.evaluation_dir / f'count_error_h{hour:02d}.png'
+                plt.savefig(plot_path, dpi=300, bbox_inches='tight', pad_inches=0.1)
+                logger.info(f"Saved hourly pct-error map to {plot_path}")
+                plt.close(fig)
 
     def _plot_traffic_heatmap(self, ax, links_with_volume: pd.DataFrame,
                               matched_devices: pd.DataFrame, comparison_df: pd.DataFrame):

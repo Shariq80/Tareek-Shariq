@@ -14,7 +14,9 @@
     ]
   },
   "data": {
-    "data_dir": "/path/to/your/data",
+    "data_dir": "/home/exouser/Documents/twin-cities-sim/data",
+    "census_api_key": "YOUR_CENSUS_API_KEY_HERE",
+    "_census_api_key_help": "Free API key from https://api.census.gov/data/key_signup.html. Used by demand_estimator.py to fetch ACS commute data (B08301, B08303) for calibration",
     "lodes": {
       "year": 2023,
       "job_type": "JT00",
@@ -84,7 +86,7 @@
         "_access_buffer_meters_help": "MTA bus network is extremely dense across the five boroughs and NJ Transit serves the NJ counties; 1200m reflects dense urban bus coverage"
       },
       "survey_rate": "auto",
-      "config_rate": 0.20,
+      "config_rate": 0.09,
       "_config_rate_help": "NYC bus share target. MTA bus carries ~30% of NYC transit riders; ACS shows ~15-20% bus commute in the five boroughs. Set to 0.20 pre-filtering; chain_consistency will reduce to ~10-12% in output",
       "blend_weight": 0.7,
       "_blend_weight_help": "Lean heavily on config_rate since NHTS national bus share (~2%) is far below NYC's actual usage",
@@ -106,7 +108,7 @@
         "_access_buffer_meters_help": "MTA subway stations, PATH, Metro-North, and NJ Transit rail stations; 1500m captures realistic catchment for the extensive rail network"
       },
       "survey_rate": "auto",
-      "config_rate": 0.18,
+      "config_rate": 0.29,
       "_config_rate_help": "NYC rail share target. MTA subway + commuter rail carry ~70% of NYC transit riders; set to 0.18 pre-filtering; chain_consistency will reduce to ~10-12% in output",
       "blend_weight": 0.7,
       "_blend_weight_help": "Lean heavily on config_rate since NHTS national rail share (~1%) is far below NYC's actual usage",
@@ -309,13 +311,27 @@
     },
     "configurable_params": {
       "coordinateSystem": "auto",
-      "lastIteration": 100,
+      "lastIteration": 10,
       "outputDirectory": "output",
       "global.numberOfThreads": 30,
       "qsim.numberOfThreads": 30,
       "qsim.flowCapacityFactor": 0.1,
       "qsim.storageCapacityFactor": 0.12,
-      "linkStats.averageLinkStatsOverIterations": 5
+      "linkStats.averageLinkStatsOverIterations": 5,
+      "scoring.modeParams.pt.constant": 1.5,
+      "_estimator_scoring.modeParams.pt.constant": "Cold start (no prior experiment). ACS transit share 36.01% (NYC-class (>30%)). Seeding pt.constant=+1.5; subsequent runs with --experiment-dir will correct toward ACS using the clamped log-ratio update.",
+      "scoring.waitingPt": -1.0,
+      "_estimator_scoring.waitingPt": "Cold start (no prior experiment). Seeding waitingPt=-1.0 util/hr for transit density 36.01% (NYC-class (>30%)).",
+      "scoring.modeParams.walk.constant": -1.5,
+      "_estimator_scoring.modeParams.walk.constant": "Cold start (no prior experiment). ACS walk share 7.48%. Seeding walk.constant=-1.5; subsequent runs will correct toward ACS using the clamped log-ratio update.",
+      "transitRouter.searchRadius": 1500.0,
+      "_estimator_transitRouter.searchRadius": "Cold start (no prior experiment). ACS transit share 36.01% (very-high transit (>=30%) \u2014 NYC-class). Seeding transit-router params from tier table; subsequent runs with --experiment-dir adjust by one tier when realised PT share is outside [70%, 130%] of the ACS target. Setting searchRadius=1500.0.",
+      "transitRouter.extensionRadius": 300.0,
+      "_estimator_transitRouter.extensionRadius": "Cold start (no prior experiment). ACS transit share 36.01% (very-high transit (>=30%) \u2014 NYC-class). Seeding transit-router params from tier table; subsequent runs with --experiment-dir adjust by one tier when realised PT share is outside [70%, 130%] of the ACS target. Setting extensionRadius=300.0.",
+      "transitRouter.maxBeelineWalkConnectionDistance": 400.0,
+      "_estimator_transitRouter.maxBeelineWalkConnectionDistance": "Cold start (no prior experiment). ACS transit share 36.01% (very-high transit (>=30%) \u2014 NYC-class). Seeding transit-router params from tier table; subsequent runs with --experiment-dir adjust by one tier when realised PT share is outside [70%, 130%] of the ACS target. Setting maxBeelineWalkConnectionDistance=400.0.",
+      "transitRouter.directWalkFactor": 2.0,
+      "_estimator_transitRouter.directWalkFactor": "Cold start (no prior experiment). ACS transit share 36.01% (very-high transit (>=30%) \u2014 NYC-class). Seeding transit-router params from tier table; subsequent runs with --experiment-dir adjust by one tier when realised PT share is outside [70%, 130%] of the ACS target. Setting directWalkFactor=2.0."
     }
   },
   "counts": {

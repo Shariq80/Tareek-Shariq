@@ -14,6 +14,71 @@ from utils.duckdb_manager import DBManager
 
 logger = logging.getLogger(__name__)
 
+
+def ensure_counties_in_db(geoids: List[str], db_manager: DBManager) -> None:
+    """Fetch and insert any GEOIDs (and their parent states) missing from the DB via pygris."""
+    from models.models import County, State
+
+    state_fips_needed = {g[:2] for g in geoids}
+
+    with db_manager.session_scope() as session:
+        found_counties = {r.geoid for r in session.query(County.geoid).filter(County.geoid.in_(geoids)).all()}
+        found_states = {r.state_fips for r in session.query(State.state_fips).filter(State.state_fips.in_(state_fips_needed)).all()}
+
+    missing_counties = [g for g in geoids if g not in found_counties]
+    missing_states = [s for s in state_fips_needed if s not in found_states]
+
+    if not missing_counties and not missing_states:
+        return
+
+    from pygris import counties as get_counties, states as get_states
+    counties_to_add = []
+    states_to_add = []
+
+    if missing_states:
+        logger.info(f"Auto-fetching {len(missing_states)} missing states from pygris: {missing_states}")
+        try:
+            states_gdf = get_states(cache=True)
+            for _, row in states_gdf.iterrows():
+                if row['STATEFP'] in missing_states:
+                    states_to_add.append(State(
+                        state_fips=row['STATEFP'],
+                        state_name=row['NAME'],
+                        state_abbr=row['STUSPS'],
+                        geoid=row['GEOID'],
+                        aland=float(row['ALAND']) if row['ALAND'] else None,
+                        awater=float(row['AWATER']) if row['AWATER'] else None,
+                    ))
+        except Exception as e:
+            logger.warning(f"Failed to fetch states: {e}")
+
+    if missing_counties:
+        logger.info(f"Auto-fetching {len(missing_counties)} missing counties from pygris: {missing_counties}")
+        for state_fips in {g[:2] for g in missing_counties}:
+            try:
+                gdf = get_counties(state=state_fips, cache=True)
+                for _, row in gdf.iterrows():
+                    if row['GEOID'] in missing_counties:
+                        counties_to_add.append(County(
+                            geoid=row['GEOID'],
+                            state_fips=row['STATEFP'],
+                            county_fips=row['COUNTYFP'],
+                            county_name=row['NAME'],
+                            county_name_full=row.get('NAMELSAD'),
+                            aland=float(row['ALAND']) if row['ALAND'] else None,
+                            awater=float(row['AWATER']) if row['AWATER'] else None,
+                            intptlat=float(row['INTPTLAT']) if row.get('INTPTLAT') else None,
+                            intptlon=float(row['INTPTLON']) if row.get('INTPTLON') else None,
+                        ))
+            except Exception as e:
+                logger.warning(f"Failed to fetch counties for state {state_fips}: {e}")
+
+    if states_to_add or counties_to_add:
+        with db_manager.session_scope() as session:
+            for row in states_to_add + counties_to_add:
+                session.add(row)
+
+
 # Census TIGER cartographic boundary shapefile
 _COUNTY_SHP_URL = "https://www2.census.gov/geo/tiger/GENZ2022/shp/cb_2022_us_county_500k.zip"
 _COUNTY_SHP_DIR = "counties"
@@ -140,7 +205,7 @@ class RegionHelper:
         """
         from models.models import State
 
-        with self.db_manager.Session() as session:
+        with self.db_manager.session_scope() as session:
             # Get unique state FIPS from county GEOIDs
             state_fips_set = {geoid[:2] for geoid in self.county_geoids}
 
@@ -159,7 +224,7 @@ class RegionHelper:
         """
         from models.models import County, State
 
-        with self.db_manager.Session() as session:
+        with self.db_manager.session_scope() as session:
             # Build list of (state_fips, county_fips) tuples from GEOIDs
             county_parts = [(geoid[:2], geoid[2:5]) for geoid in self.county_geoids]
 

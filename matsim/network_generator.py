@@ -70,6 +70,41 @@ class NetworkGenerator:
                     route_types.add(int(rt))
         return route_types
 
+    # Schedule transportMode strings emitted by pt2matsim's Gtfs2TransitSchedule
+    # (see org.matsim.pt2matsim.gtfs.lib.GtfsDefinitions.RouteType). Each maps
+    # to a top-level config "family" — bus or rail — and to the network-mode
+    # subnetwork its vehicles run on. Keys are pt2matsim contract; values are
+    # MATSim network-mode strings consumed by Osm2MultimodalNetwork (way
+    # defaults / routableSubnetwork) and PublicTransitMapper
+    # (transportModeAssignment).
+    _SCHEDULE_MODE_TO_FAMILY = {
+        'bus':       ('bus',  'car,bus'),
+        'rail':      ('rail', 'rail,light_rail'),
+        'tram':      ('rail', 'rail,light_rail'),
+        'subway':    ('rail', 'rail,light_rail'),
+        'ferry':     ('rail', 'rail,light_rail'),  # routed on rail subnet — no ferry network
+        'cable car': ('rail', 'rail,light_rail'),
+        'gondola':   ('rail', 'rail,light_rail'),
+        'funicular': ('rail', 'rail,light_rail'),
+    }
+
+    def _get_schedule_mode_assignments(self) -> Dict[str, str]:
+        """Return {schedule_mode: network_modes} for every schedule mode whose
+        family is enabled in config.
+
+        The mapping is defined in ``_SCHEDULE_MODE_TO_FAMILY`` (pt2matsim
+        contract) and gated by the top-level ``modes.<bus|rail>.enabled``
+        flags from config. Used by ``_write_pt_mapper_config_xml`` so the
+        mapper does not silently drop tram / subway / etc. routes whose
+        schedule mode lacks a transportModeAssignment.
+        """
+        enabled_families = set(self._get_enabled_transit_modes())
+        return {
+            sched_mode: net_modes
+            for sched_mode, (family, net_modes) in self._SCHEDULE_MODE_TO_FAMILY.items()
+            if family in enabled_families
+        }
+
     def get_matsim_jar_path(self) -> Path:
         """
         Get path to MATSim JAR file
@@ -581,7 +616,19 @@ class NetworkGenerator:
         rail_enabled = 'rail' in enabled_transit
 
         # Highway wayDefaultParams: (osmValue, lanes, freespeed m/s, capacity, oneway, modes)
-        # Bus-capable roads include 'bus' in allowed modes only if bus mode is enabled
+        # Bus-capable roads include 'bus' in allowed modes only if bus mode is enabled.
+        #
+        # Freespeed is the FALLBACK applied when an OSM way has no maxspeed=*
+        # tag. Values below are tuned for US urban arterials (statutory
+        # speed limits in MN/most US states):
+        #   secondary:       60 km/h ≈ 35 mph (state highways, major arterials)
+        #   secondary_link:  40 km/h ≈ 25 mph (ramps/connectors)
+        #   tertiary:        50 km/h ≈ 30 mph (collectors)
+        #   tertiary_link:   30 km/h ≈ 19 mph
+        #   unclassified:    40 km/h ≈ 25 mph (minor through streets)
+        #   residential:     40 km/h ≈ 25 mph (US residential statutory default)
+        #   living_street:   10 km/h ≈ 6 mph  (shared-space — kept slow)
+        # See backlog: "make wayDefaults config-driven for non-US regions".
         car_bus = 'car,bus' if bus_enabled else 'car'
         highway_defaults = [
             ('motorway',      '2.0', '33.33', '2000.0', 'true',  'car'),
@@ -590,12 +637,12 @@ class NetworkGenerator:
             ('trunk_link',    '1.0', '13.89', '1500.0', 'false', 'car'),
             ('primary',       '1.0', '22.22', '1500.0', 'false', car_bus),
             ('primary_link',  '1.0', '16.67', '1500.0', 'false', car_bus),
-            ('secondary',     '1.0', '8.33',  '1000.0', 'false', car_bus),
-            ('secondary_link','1.0', '8.33',  '1000.0', 'false', car_bus),
-            ('tertiary',      '1.0', '6.94',  '600.0',  'false', car_bus),
-            ('tertiary_link', '1.0', '6.94',  '600.0',  'false', car_bus),
-            ('unclassified',  '1.0', '4.17',  '600.0',  'false', car_bus),
-            ('residential',   '1.0', '4.17',  '600.0',  'false', car_bus),
+            ('secondary',     '1.0', '16.67', '1000.0', 'false', car_bus),
+            ('secondary_link','1.0', '11.11', '1000.0', 'false', car_bus),
+            ('tertiary',      '1.0', '13.89', '600.0',  'false', car_bus),
+            ('tertiary_link', '1.0', '8.33',  '600.0',  'false', car_bus),
+            ('unclassified',  '1.0', '11.11', '600.0',  'false', car_bus),
+            ('residential',   '1.0', '11.11', '600.0',  'false', car_bus),
             ('living_street', '1.0', '2.78',  '300.0',  'false', 'car'),
         ]
         for osm_val, lanes, speed, cap, oneway, modes in highway_defaults:
@@ -1209,17 +1256,20 @@ class NetworkGenerator:
         for name, value in params.items():
             ET.SubElement(module, 'param', name=name, value=value)
 
-        # Transport mode assignments: only for enabled transit modes
-        mode_to_network = {
-            'bus': 'car,bus',
-            'rail': 'rail,light_rail',
-        }
-        for sched_mode in enabled_transit:
-            net_modes = mode_to_network.get(sched_mode)
-            if net_modes:
-                ps = ET.SubElement(module, 'parameterset', type='transportModeAssignment')
-                ET.SubElement(ps, 'param', name='scheduleMode', value=sched_mode)
-                ET.SubElement(ps, 'param', name='networkModes', value=net_modes)
+        # Transport mode assignments: every schedule mode pt2matsim might emit
+        # (tram, subway, rail, bus, ferry, ...) needs a transportModeAssignment,
+        # otherwise PublicTransitMapper silently drops those routes during
+        # mapping. We register one assignment per schedule mode whose family
+        # is enabled in config — see _get_schedule_mode_assignments.
+        sched_assignments = self._get_schedule_mode_assignments()
+        if sched_assignments:
+            logger.info(
+                f"  PT mapper schedule-mode assignments: {sorted(sched_assignments.keys())}"
+            )
+        for sched_mode, net_modes in sched_assignments.items():
+            ps = ET.SubElement(module, 'parameterset', type='transportModeAssignment')
+            ET.SubElement(ps, 'param', name='scheduleMode', value=sched_mode)
+            ET.SubElement(ps, 'param', name='networkModes', value=net_modes)
 
         tree = ET.ElementTree(config)
         ET.indent(tree, space='    ')
@@ -1382,14 +1432,20 @@ class NetworkGenerator:
         Additionally, *before* the per-route checks, a graph-reachability
         analysis runs:
 
-        7. **Terminal-stop road reachability** – the first stop must be
-           *reachable from* the road network and the last stop must be
-           able to *reach* the road network, both via directed links.
-           MATSim's ``UmlaufInterpolator`` routes transit vehicles
-           between the last stop of one departure and the first stop of
-           the next ("Wende"); if a terminal stop sits on a one-way
-           ``pt_*``-only chain with no directed path back to the road
-           network, Dijkstra fails at runtime with "No route found".
+        7. **Terminal-stop road reachability (bus routes only)** – the
+           first stop must be *reachable from* the road network and the
+           last stop must be able to *reach* the road network, both via
+           directed links over the bus/artificial subnetwork.  MATSim's
+           ``UmlaufInterpolator`` routes transit vehicles between the
+           last stop of one departure and the first stop of the next
+           ("Wende"); if a bus terminal stop sits on a one-way ``pt_*``-only
+           chain with no directed path back to the road network, Dijkstra
+           fails at runtime with "No route found".  This check is **not**
+           applied to rail-family routes (rail/tram/subway/light_rail/...)
+           because those vehicles deadhead over rail links, not roads, and
+           the bus/artificial adjacency graph would systematically reject
+           them as "isolated" even when their rail subnetwork is fully
+           connected.
 
         Routes that fail any check are removed.  Empty ``<transitLine>``
         elements are also pruned.
@@ -1564,7 +1620,19 @@ class NetworkGenerator:
                 #     Dijkstra fails with "No route found".
                 #     - First stop: road must be able to route TO it
                 #     - Last stop: it must be able to route TO road
-                if not broken and profile is not None:
+                #
+                #     Bus-only check: rail/tram/subway vehicles deadhead over
+                #     rail links, not roads, and their stops sit on rail-only
+                #     subnetworks by design (LRT terminals on light_rail
+                #     OSM ways have no bus/artificial connectivity to the
+                #     road graph). The fwd/rev adjacency below is built from
+                #     bus + artificial links only, so applying this check to
+                #     rail-family routes systematically deletes them — exactly
+                #     what we observed for MetroTransit's Blue/Green LRT lines.
+                tm_elem = route_elem.find('transportMode')
+                route_mode = tm_elem.text.strip() if tm_elem is not None and tm_elem.text else ''
+                check7_applies = route_mode == 'bus'
+                if not broken and check7_applies and profile is not None:
                     stops = profile.findall('stop')
                     if stops:
                         checks = [('first', stops[0], reachable_from_road),
