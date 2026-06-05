@@ -64,18 +64,45 @@ ACTIVITY_OSM_TAGS = {
 # ============================================================================
 
 class POIManager:
+    # Public Overpass mirrors tried in order. The main api.de server has
+    # intermittent HTTP 406 issues; kumi.systems is a well-maintained backup.
+    # See: https://wiki.openstreetmap.org/wiki/Overpass_API#Public_Overpass_API_instances
+    DEFAULT_OVERPASS_URLS = [
+        'https://overpass-api.de/api/interpreter',
+        'https://overpass.kumi.systems/api/interpreter',
+        'https://overpass.private.coffee/api/interpreter',
+    ]
+
     def __init__(self,
                  db_manager: DBManager,
-                 overpass_url: str = 'http://overpass-api.de/api/interpreter'):
+                 overpass_url: Optional[str] = None,
+                 overpass_urls: Optional[List[str]] = None):
         """
         Initialize POI Manager with existing DBManager.
 
         Args:
             db_manager: Existing DBManager instance
-            overpass_url: Overpass API URL
+            overpass_url: (Legacy) Single Overpass URL. If provided, used as the
+                primary endpoint and the defaults are appended as fallbacks.
+            overpass_urls: List of Overpass URLs tried in order. Falls back to
+                DEFAULT_OVERPASS_URLS if not provided.
         """
         self.db_manager = db_manager
-        self.overpass = overpy.Overpass(url=overpass_url)
+
+        # Resolve URL list
+        if overpass_urls:
+            self.overpass_urls = list(overpass_urls)
+        elif overpass_url:
+            self.overpass_urls = [overpass_url] + [
+                u for u in self.DEFAULT_OVERPASS_URLS if u != overpass_url
+            ]
+        else:
+            self.overpass_urls = list(self.DEFAULT_OVERPASS_URLS)
+
+        # Active server starts at index 0; rotates on persistent failures.
+        self._active_url_idx = 0
+        self.overpass = overpy.Overpass(url=self.overpass_urls[0])
+
         # Set retry parameters for large queries
         overpy.Overpass.default_max_retry_count = 5
         overpy.Overpass.default_retry_timeout = 2.0
@@ -84,7 +111,49 @@ class POIManager:
         self._spatial_index = None
         self._spatial_index_cache_key = None
 
-        logger.info("POIManager initialized")
+        logger.info(f"POIManager initialized (Overpass servers: {len(self.overpass_urls)} configured)")
+        for i, url in enumerate(self.overpass_urls):
+            tag = " [primary]" if i == 0 else " [fallback]"
+            logger.info(f"  {i+1}.{tag} {url}")
+
+    def _is_server_error(self, exc: Exception) -> bool:
+        """Detect errors that indicate the current server is unhealthy and we
+        should rotate to the next mirror (vs. transient errors worth retrying)."""
+        msg = str(exc).lower()
+        # HTTP status codes that indicate the SERVER is the problem, not the query
+        server_indicators = ('406', '403', '429', '502', '503', '504',
+                             'gateway', 'unavailable', 'too many requests',
+                             'not acceptable', 'forbidden')
+        return any(s in msg for s in server_indicators)
+
+    def _rotate_overpass_server(self) -> bool:
+        """Switch to the next Overpass mirror. Returns True if a different
+        server is now active, False if all servers have been tried."""
+        if self._active_url_idx + 1 >= len(self.overpass_urls):
+            return False
+        self._active_url_idx += 1
+        new_url = self.overpass_urls[self._active_url_idx]
+        logger.warning(f"Rotating to fallback Overpass server: {new_url}")
+        self.overpass = overpy.Overpass(url=new_url)
+        return True
+
+    def _query_overpass_with_failover(self, query: str):
+        """Execute an Overpass query, rotating to the next mirror on server errors.
+        Raises the last exception if all servers fail."""
+        last_exc = None
+        # Try the active server first; if it dies with a server-side error,
+        # rotate and try the same query on the next mirror. Don't loop forever.
+        for _ in range(len(self.overpass_urls)):
+            try:
+                return self.overpass.query(query)
+            except Exception as exc:
+                last_exc = exc
+                if self._is_server_error(exc) and self._rotate_overpass_server():
+                    logger.info("Retrying same query on the next Overpass server...")
+                    continue
+                raise
+        # All servers exhausted with server errors
+        raise last_exc
     
     # ========================================================================
     # OSM QUERYING & PROCESSING
@@ -509,7 +578,7 @@ out center;
                     try:
                         time.sleep(wait_time)
                         logger.info(f"Trying {strategy_name} query strategy (attempt {attempt + 1}/{max_retries})")
-                        result = self.overpass.query(query)
+                        result = self._query_overpass_with_failover(query)
 
                         # Check if we got results
                         total_elements = len(result.nodes) + len(result.ways)
@@ -572,7 +641,7 @@ out center;
 
         try:
             time.sleep(wait_time)
-            result = self.overpass.query(query)
+            result = self._query_overpass_with_failover(query)
             self._process_osm_result(result, source='city', source_names=[city_name.lower()],
                                      state_fips=state_fips, county_fips=county_fips)
         except Exception as e:
@@ -963,7 +1032,7 @@ out center;
             area["ref:fips"="{full_fips}"];
             out tags;
             """
-            result = self.overpass.query(query)
+            result = self._query_overpass_with_failover(query)
 
             if result.areas:
                 for area in result.areas:
