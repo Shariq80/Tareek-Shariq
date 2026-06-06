@@ -11,11 +11,18 @@ This ensures the estimator works correctly for any region defined by the countie
 in config.json.
 
 Usage:
+    # Cold start - positional is the base config JSON
     python estimators/demand_estimator.py config/USA/TwinCities/config_twin.json
-    python estimators/demand_estimator.py config/USA/TwinCities/config_twin.json --experiment-dir experiments/exp_20260301
+
+    # Feedback - positional is the region FOLDER, --experiment-dir provides
+    # the simulation result; the estimator reads <exp>/config_used.json and
+    # writes <region>/config_estimated.json
+    python estimators/demand_estimator.py config/USA/TwinCities \
+        --experiment-dir experiments/exp_20260301
 
 Output:
-    config/USA/TwinCities/config_twin_estimated.json
+    Cold start:  <config_dir>/<stem>_estimated.json
+    Feedback:    <region_folder>/config_estimated.json
 """
 import argparse
 import copy
@@ -31,6 +38,163 @@ from typing import Any, Dict, List, Tuple
 project_root = Path(__file__).parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
+
+
+def _resolve_experiment_dir(value: str) -> Path:
+    """Accept either a full path to an experiment folder or just its name.
+
+    A bare name (no separators or no leading drive/slash) is resolved
+    against <project_root>/experiments/<name>. A full path is used as-is.
+    """
+    p = Path(value)
+    if p.is_dir():
+        return p
+    # Bare name (or relative path that doesn't exist as-is): try project_root/experiments/
+    candidate = project_root / "experiments" / value
+    if candidate.is_dir():
+        return candidate
+    raise SystemExit(
+        f"ERROR: --experiment-dir does not exist: tried {p} and {candidate}"
+    )
+
+
+def _print_acs_coverage_error(
+    requested_fips: List[str],
+    returned_fips: List[str],
+) -> None:
+    """Write a structured ACS-coverage failure report to stderr.
+
+    Called from both estimators when the ACS fetch returned data for fewer
+    than half of the configured counties. The message distinguishes the two
+    failure modes (no states returned anything vs partial coverage) and
+    lists the failed states so the user can correlate with the per-state
+    retry warnings printed earlier in stdout.
+    """
+    requested_states = sorted({f[:2] for f in requested_fips})
+    returned_states = sorted({f[:2] for f in returned_fips})
+    failed_states = sorted(set(requested_states) - set(returned_states))
+    missing_counties = sorted(set(requested_fips) - set(returned_fips))
+    coverage = len(returned_fips) / len(requested_fips) if requested_fips else 0.0
+
+    print("=" * 70, file=sys.stderr)
+    print("  ERROR: ACS coverage too low to calibrate the region.", file=sys.stderr)
+    print("=" * 70, file=sys.stderr)
+    print(
+        f"  Coverage: {coverage:.0%} ({len(returned_fips)}/{len(requested_fips)} counties)\n"
+        f"  Requested states: {', '.join(requested_states)}\n"
+        f"  Failed states:    {', '.join(failed_states) if failed_states else '(none — all states returned data)'}\n"
+        f"  Missing counties: {', '.join(missing_counties)}",
+        file=sys.stderr,
+    )
+    if not returned_fips:
+        # Zero states succeeded → almost always key, network, or API outage.
+        print(
+            "\n  Likely cause: ALL state requests failed. The most common reasons are:\n"
+            "    1. Census API key is invalid or not yet activated\n"
+            "       (check email from api.census.gov for the activation link)\n"
+            "    2. Network / DNS / VPN issue from this machine\n"
+            "       (see 'DNS RESOLUTION FAILED' lines in the run log above)\n"
+            "    3. Census API is down or rate-limiting (rare; retry in ~15min)\n"
+            "  See the per-state retry warnings in stdout above for the exact\n"
+            "  HTTP errors encountered. Refusing to write config_estimated.json.",
+            file=sys.stderr,
+        )
+    else:
+        # Some states returned data, others didn't. Either transient outage
+        # for specific states, or the user configured an invalid/deprecated
+        # county FIPS (e.g. Connecticut's 2022 reorganization away from
+        # county FIPS to planning-region FIPS).
+        print(
+            "\n  Likely cause: PARTIAL failure — some states returned data, others didn't.\n"
+            "    1. Transient outage for the failed states above\n"
+            "       (see retry warnings in stdout above; rerun in ~15min)\n"
+            "    2. Deprecated / invalid county FIPS in config.region.counties\n"
+            "       (e.g. Connecticut switched from counties to planning regions\n"
+            "       in 2022; old CT county FIPS no longer return data in ACS 2023+)\n"
+            "    3. Typo in a county FIPS — verify each missing county against\n"
+            "       https://www.census.gov/library/reference/code-lists/ansi.html\n"
+            "  Refusing to write config_estimated.json.",
+            file=sys.stderr,
+        )
+
+
+def require_acs_key(config: Dict[str, Any], config_path: Path | str) -> str:
+    """Return the Census ACS key from config or exit loudly.
+
+    Both estimators rely on ACS B08301. Running without a key produced silent
+    failures (empty ACS dict -> 0% targets -> nonsense recommendations), so
+    this is a hard gate. Shared between estimator.py, demand_estimator.py and
+    mode_share_estimator.py so the message is identical no matter which entry
+    point is used.
+    """
+    api_key = (config.get("data", {}).get("census_api_key", "") or "").strip()
+    if api_key:
+        return api_key
+    print("=" * 70, file=sys.stderr)
+    print("  ERROR: census_api_key missing from config.", file=sys.stderr)
+    print("=" * 70, file=sys.stderr)
+    print(
+        f"  Config read: {config_path}\n"
+        f"  Both estimators rely on Census ACS B08301 (mode share) data.\n"
+        f"  Without a key the demand estimator cannot calibrate transit\n"
+        f"  parameters and the mode-share estimator cannot compute targets;\n"
+        f"  the resulting config_estimated.json would be unsafe to apply.\n"
+        f"  Add 'census_api_key' under 'data' in config.json.\n"
+        f"  Free key signup: https://api.census.gov/data/key_signup.html",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+
+def resolve_estimator_inputs(
+    positional: str,
+    experiment_dir: str | None,
+) -> Tuple[Path, Path]:
+    """Resolve (config_to_read, estimated_output_path) for an estimator run.
+
+    Two operating modes:
+
+      Cold start (experiment_dir is None):
+          positional must be a config JSON file.
+          Read positional, write <stem>_estimated.json next to it.
+          If positional already ends with _estimated, write back in place
+          (chained re-run on the same estimate).
+
+      Feedback (experiment_dir is provided):
+          positional must be a region folder.
+          Read <experiment_dir>/config_used.json as the state to update.
+          Write to <region_folder>/config_estimated.json.
+
+    Returns (read_from, write_to) as absolute paths.
+    """
+    pos = Path(positional)
+    if experiment_dir is None:
+        if not pos.is_file():
+            raise SystemExit(
+                f"ERROR: Config file not found: {pos}\n"
+                f"(Cold start expects a JSON file. For feedback runs, pass a "
+                f"region folder and --experiment-dir.)"
+            )
+        stem = pos.stem
+        if stem.endswith("_estimated"):
+            write_to = pos
+        else:
+            write_to = pos.with_name(f"{stem}_estimated{pos.suffix}")
+        return pos, write_to
+
+    if not pos.is_dir():
+        raise SystemExit(
+            f"ERROR: With --experiment-dir, the positional argument must be a "
+            f"region folder, not a file: {pos}"
+        )
+    exp = _resolve_experiment_dir(experiment_dir)
+    config_used = exp / "config_used.json"
+    if not config_used.is_file():
+        raise SystemExit(
+            f"ERROR: config_used.json not found in experiment dir: {config_used}"
+        )
+    write_to = pos / "config_estimated.json"
+    return config_used, write_to
 
 
 class TeeWriter:
@@ -821,14 +985,26 @@ def compute_transit_calibration(
 
     The calibration logic follows the approach described in the evaluation:
     - Compute regional weighted-average bus and rail commute shares from ACS
-    - Set config_rate above the target output share because the chain consistency
-      constraint (all legs must have the mode available) removes 40-70% of
-      transit-eligible chains
+    - Set config_rate above the target output share because the chain
+      consistency constraint (all legs must have the mode available)
+      removes ~30-50% of transit-eligible chains depending on regional
+      transit share (seed values are 30/40/45/50% for transit shares
+      >20/10/5/0%). After the walk-pass-through change in mode_choice.py
+      these seeds were lowered ~15pp from the previous 45-65% range —
+      short interior legs are now excused from the chain intersection
+      and emitted as walk rather than dropping the whole chain. Empirical
+      values from a prior experiment override the seed when available.
     - Set blend_weight based on how far the regional transit share is from the
       NHTS national average (~3-5% total transit)
     - Set access_buffer_meters based on transit density (higher share = denser
       network = larger reasonable walking catchment)
-    - Adjust scaling_factor to compensate for agents shifting from car to transit
+
+    Note: this function intentionally does NOT touch scaling_factor or the
+    capacity factors. scaling_factor is the population sample fraction —
+    it controls how many agents are simulated regardless of mode, so a
+    mode shift from car to transit does not change it. If the resulting
+    car-only volumes look low after a transit-share calibration, that is
+    a separate decision driven by counts, not by ACS mode shares.
 
     Args:
         acs_data: Per-county ACS data from fetch_acs_commute_data().
@@ -1004,26 +1180,12 @@ def compute_transit_calibration(
     else:
         rec_rail_buffer = 1200  # default
 
-    # scaling_factor adjustment: compensate for agents shifting car -> transit
-    # More transit = fewer car agents, so increase scaling to maintain road volumes
+    # Measure the expected car-volume reduction from the transit shift, for
+    # the diagnostic warning only. scaling_factor / flow / storage are left
+    # untouched: scaling_factor is the population sample fraction and does
+    # not depend on mode mix. If counts later show car volumes are low, the
+    # counts-driven path in recommend_adjustments handles that separately.
     expected_transit_output = target_output_bus + target_output_rail
-    # car fraction after transit shift: (1 - expected_transit_output)
-    # to maintain same car volume: new_sf * (1 - transit_out) ≈ old_sf * ~0.99
-    if expected_transit_output > 0.01:
-        rec_scaling = round(cur_scaling * 0.99 / (1 - expected_transit_output), 3)
-    else:
-        rec_scaling = cur_scaling
-
-    # Hard constraint: scaling_factor must never exceed flow_capacity_factor.
-    # If rec_scaling > cur_flow_cap the network cannot handle the generated demand
-    # (agents × car share > link capacities), causing mass gridlock and stuck
-    # agents. Cap rec_scaling at cur_flow_cap; if a higher scaling is genuinely
-    # needed, both capacity factors must be raised in lock-step.
-    if rec_scaling > cur_flow_cap:
-        rec_scaling = cur_flow_cap
-    # Paired capacity factors always track scaling_factor: flow = sf, storage = sf * 1.2
-    rec_flow_cap = round(rec_scaling, 3)
-    rec_storage_cap = round(rec_scaling * 1.2, 3)
 
     # --- Build recommendations list ---
     recommendations = []
@@ -1099,32 +1261,33 @@ def compute_transit_calibration(
                       f"{'dense' if rail_share > 0.05 else 'moderate'} rail station spacing.",
         })
 
-    # Scaling factor + paired capacity factors (must move together)
-    if rec_scaling > cur_scaling + 0.002:
+    # Informational only: warn that calibrating PT/rail upward will reduce
+    # the car share, which mechanically lowers simulated car volumes on the
+    # network. scaling_factor and capacity factors are intentionally NOT
+    # changed here — see the function docstring. The counts-driven path in
+    # recommend_adjustments is the only place that may adjust scaling_factor.
+    if expected_transit_output > 0.01:
+        car_volume_drop = expected_transit_output  # car share goes down by ~ this much
         recommendations.append({
-            "parameter": "plan_generation.scaling_factor",
-            "current": cur_scaling,
-            "recommended": rec_scaling,
-            "reason": f"Compensate for ~{expected_transit_output:.1%} of agents shifting from car to transit. "
-                      f"Maintains comparable road network volumes: "
-                      f"{rec_scaling} x {1 - expected_transit_output:.2f} ≈ {cur_scaling} x 0.99.",
-        })
-    if rec_flow_cap != cur_flow_cap:
-        recommendations.append({
-            "parameter": "matsim.configurable_params.qsim.flowCapacityFactor",
-            "current": cur_flow_cap,
-            "recommended": rec_flow_cap,
-            "reason": f"flowCapacityFactor must equal scaling_factor ({rec_scaling}). "
-                      f"Mismatches cause agents × car share to exceed link capacity, "
-                      f"producing gridlock and stuck agents.",
-        })
-    if rec_storage_cap != cur_storage_cap:
-        recommendations.append({
-            "parameter": "matsim.configurable_params.qsim.storageCapacityFactor",
-            "current": cur_storage_cap,
-            "recommended": rec_storage_cap,
-            "reason": f"storageCapacityFactor should be ~1.2 × scaling_factor ({rec_flow_cap} × 1.2 = {rec_storage_cap}). "
-                      f"Keep above flowCapacityFactor to avoid back-pressure blocking link entry.",
+            "parameter": "_info.transit_shift_volume_warning",
+            "current": (
+                f"target transit output ~{expected_transit_output:.1%} "
+                f"(bus ~{target_output_bus:.1%}, rail ~{target_output_rail:.1%})"
+            ),
+            "recommended": "no automatic scaling_factor change",
+            "reason": (
+                f"After applying the transit calibration, the simulated car "
+                f"mode share will drop by ~{car_volume_drop:.1%}, mechanically "
+                f"reducing car volumes at count stations by a similar amount. "
+                f"scaling_factor (currently {cur_scaling}) and capacity factors "
+                f"(flow={cur_flow_cap}, storage={cur_storage_cap}) are NOT "
+                f"changed here: scaling_factor is the population sample "
+                f"fraction and does not depend on mode mix. If observed-vs-sim "
+                f"car volumes look low after this calibration runs, address "
+                f"that through the counts-driven path (which uses iqr_mean of "
+                f"per-station sim/obs ratios), not by inflating scaling_factor "
+                f"to compensate for a mode shift."
+            ),
         })
 
     return {
@@ -1153,7 +1316,6 @@ def compute_transit_calibration(
             "seed": round(chain_reduction_seed, 4),
         },
         "all_trip_factor": all_trip_factor,
-        "scaling_factor": rec_scaling,
         "recommendations": recommendations,
     }
 
@@ -1332,9 +1494,17 @@ def recommend_adjustments(
         })
 
     # --- Check 0b: Experiment feedback — actual MATSim output vs planned ---
+    # The sf recommendation only compensates for *measured* simulation losses
+    # (plan-generation shortfall + stuck agents). It does NOT try to close
+    # the count gap by inflating scaling_factor — scaling_factor represents
+    # the sample fraction of the *resident* population, so the right ceiling
+    # is "10% sampled, plus a small allowance for losses around that 10%."
+    # Anything larger over-represents residents to compensate for things
+    # that aren't residents (freight, through-traffic, visitors, survey
+    # under-estimation) and degrades calibration rather than helping it.
     needs_more_demand = False
-    demand_multiplier = 1.0
-    plan_gen_ratio = 1.0  # measured plan-generator yield; 1.0 = no measurement
+    plan_gen_ratio = 1.0    # measured plan-generator yield (1.0 = no measurement)
+    stuck_fraction = 0.0    # measured stuck-agent fraction (0.0 = no measurement)
 
     if experiment_feedback:
         summary = experiment_feedback.get("summary", {})
@@ -1378,28 +1548,24 @@ def recommend_adjustments(
                               f"(most plans are simple Home-Work-Home with 2 legs).",
                 })
 
-        # Check evaluation metrics — the real ground truth.
+        # Evaluation metrics decide whether to recommend a sf bump.
         #
-        # The previous version of this block fired needs_more_demand whenever
-        # mean_pct_error < -30%. That metric is volume-weighted and dragged
-        # down catastrophically by boundary count stations capturing
-        # through-traffic from outside the modeled area (typical pattern:
-        # a few freeway-boundary stations show simulated ~2% of observed,
-        # which has nothing to do with demand). Recommending a 2-3x
-        # scaling-factor bump in that case overloads the network because
-        # flow/storage capacity factors stay at their original values, and
-        # the geometric coverage gap remains unfixed.
+        # Gate is driven by iqr_mean (interquartile mean of per-station
+        # sim/obs ratios — robust to boundary/through-traffic outliers and
+        # to a few catastrophic stations that drag mean_pct_error and GEH<5
+        # down without telling us anything about the interior of the
+        # modeled region). NHTS-implied yield is reported as advisory only
+        # because the survey benchmark is a national rate and is known to
+        # disagree with regional count totals (e.g. for LA, NHTS gives
+        # ~2.35 trips/capita/day vs counts implying ~4x higher car volumes
+        # driven by external/freight/visitor trips the survey can't see).
         #
-        # New gate (two checks, both must fail before recommending more demand):
-        #   1) Yield: output_trips_count / (survey_tpc × total_pop × sf).
-        #      Measures whether the simulation produced the trip volume that
-        #      the survey benchmark predicts. yield >= 0.85 means demand is
-        #      already on-target by survey standards, regardless of count
-        #      gaps.
-        #   2) Interquartile mean station ratio: robust per-station measure
-        #      that drops the worst & best 25% of stations. iqr_mean >= 0.7
-        #      means the bulk of stations are reasonably matched even if a
-        #      few outliers tank the unweighted mean.
+        # The sf recommendation that comes out of this block ONLY
+        # compensates for measured simulation losses (plan-gen + stuck);
+        # see the sf math after the rate-levers section.
+        stuck_agents = summary.get("matsim_output", {}).get("total_stuck_agents", 0)
+        if actual_plans > 0:
+            stuck_fraction = stuck_agents / actual_plans
         if eval_data:
             mean_pct_error = eval_data.get("mean_pct_error", 0)
             geh_lt_5 = eval_data.get("geh_lt_5_pct", 0)
@@ -1407,23 +1573,15 @@ def recommend_adjustments(
             pct_below_10 = eval_data.get("pct_stations_below_10pct", 0.0)
             num_below_10 = eval_data.get("num_stations_below_10pct", 0)
 
-            # --- Gate 1: Yield (survey-benchmark trip volume vs. simulated) ---
-            # Trip-count yield is computed from output_trips_count (already a
-            # scaled-population number) against the survey-derived expected
-            # scaled trip count. The survey benchmark (~2.35 trips/capita/day
-            # for NHTS-blended national rate) is a conservative lower bound
-            # for most metros, so a yield near 1.0 means we are already at
-            # or above the survey-implied volume — any remaining gap to
-            # observed traffic is geometric, not demand-side.
+            # Advisory: NHTS-implied trip-volume yield. Printed for context
+            # so the user can see whether the simulation produced trips at
+            # the survey-implied rate. NOT used to gate sf decisions.
             actual_trips = summary.get("matsim_output", {}).get("output_trips_count", 0)
             expected_unscaled = total_pop * benchmarks["survey_trips_per_capita"]
             expected_scaled = expected_unscaled * scaling_factor
             yield_ratio = actual_trips / expected_scaled if expected_scaled > 0 else 0.0
 
-            # --- Gate 2: Interquartile-mean station ratio ---
-            # Falls back to (1 + mean_pct_error/100) if iqr_mean wasn't
-            # written (older experiments). That fallback preserves prior
-            # behaviour for old summaries while the new field rolls in.
+            # iqr_mean fallback for older experiments that didn't write it.
             if iqr_mean is None or iqr_mean <= 0:
                 iqr_mean_used = max(1.0 + mean_pct_error / 100.0, 0.0)
                 iqr_source = "fallback from mean_pct_error"
@@ -1431,28 +1589,18 @@ def recommend_adjustments(
                 iqr_mean_used = float(iqr_mean)
                 iqr_source = "interquartile_mean_ratio"
 
-            YIELD_GATE = 0.85
-            IQR_GATE = 0.70
+            # Thresholds — counts-driven, single gate on iqr_mean:
+            #   >= IQR_OK     -> counts look fine, no sf change.
+            #   >= IQR_LOW    -> counts moderately low, small compensation bump.
+            #   <  IQR_LOW    -> counts catastrophically low, same compensation
+            #                    bump PLUS a loud user-review diagnostic.
+            IQR_OK = 0.70
+            IQR_LOW = 0.50
 
-            yield_passes = yield_ratio >= YIELD_GATE   # demand looks fine
-            iqr_passes = iqr_mean_used >= IQR_GATE     # stations look fine
+            iqr_ok = iqr_mean_used >= IQR_OK
+            iqr_catastrophic = iqr_mean_used < IQR_LOW
 
             # Always report what we measured, regardless of decision.
-            recommendations.append({
-                "parameter": "_info.experiment_yield",
-                "current": (
-                    f"output_trips={actual_trips:,}, "
-                    f"expected_scaled={expected_scaled:,.0f}, "
-                    f"yield={yield_ratio:.1%}"
-                ),
-                "recommended": f"yield >= {YIELD_GATE:.0%}",
-                "reason": (
-                    f"Yield = output_trips / (survey_tpc * total_pop * sf) "
-                    f"= {actual_trips:,} / ({benchmarks['survey_trips_per_capita']:.2f} "
-                    f"* {total_pop:,} * {scaling_factor}) = {yield_ratio:.1%}. "
-                    f"{'PASSES' if yield_passes else 'FAILS'} the {YIELD_GATE:.0%} gate."
-                ),
-            })
             recommendations.append({
                 "parameter": "_info.station_ratio_summary",
                 "current": (
@@ -1461,85 +1609,86 @@ def recommend_adjustments(
                     f"GEH<5={geh_lt_5:.1f}%, "
                     f"stations<10%={num_below_10} ({pct_below_10:.0f}%)"
                 ),
-                "recommended": f"iqr_mean >= {IQR_GATE:.0%}",
+                "recommended": f"iqr_mean >= {IQR_OK:.0%}",
                 "reason": (
                     f"Interquartile mean of per-station sim/obs ratios drops "
                     f"the worst & best 25% of stations and averages the middle 50%. "
                     f"Robust to boundary stations with through-traffic from outside "
-                    f"the modeled area. {'PASSES' if iqr_passes else 'FAILS'} the "
-                    f"{IQR_GATE:.0%} gate."
+                    f"the modeled area. mean_pct_error and GEH<5 are reported for "
+                    f"context but are volume-weighted and dominated by a few "
+                    f"boundary outliers, so they do not gate sf decisions."
+                ),
+            })
+            recommendations.append({
+                "parameter": "_info.yield_advisory",
+                "current": (
+                    f"output_trips={actual_trips:,}, "
+                    f"expected_scaled={expected_scaled:,.0f}, "
+                    f"yield={yield_ratio:.1%}"
+                ),
+                "recommended": "advisory only — not used to gate sf",
+                "reason": (
+                    f"NHTS-implied yield = output_trips / (survey_tpc * total_pop * sf) "
+                    f"= {yield_ratio:.1%}. The NHTS benchmark ({benchmarks['survey_trips_per_capita']:.2f} "
+                    f"trips/capita/day) is a national survey rate and can disagree "
+                    f"with regional count totals because of external trips, freight, "
+                    f"visitors, and survey under-estimation of local daily activity. "
+                    f"Counts (iqr_mean above) drive the decision; this number is "
+                    f"shown for transparency only."
                 ),
             })
 
-            # Decision:
-            if yield_passes:
-                # Demand-on-target by survey standards. The remaining gap to
-                # observed traffic (if any) is geometric/network, not demand.
-                if not iqr_passes:
-                    recommendations.append({
-                        "parameter": "_info.geometric_coverage_gap",
-                        "current": (
-                            f"yield={yield_ratio:.0%} (demand OK) but "
-                            f"iqr_mean={iqr_mean_used:.0%} (stations under-counted)"
-                        ),
-                        "recommended": "review boundary stations; consider expanding modeled region",
-                        "reason": (
-                            f"Simulated trip volume matches survey benchmark "
-                            f"({yield_ratio:.0%} of expected). The remaining count "
-                            f"shortfall is NOT a demand problem and cannot be fixed "
-                            f"by raising scaling_factor. Likely cause: boundary count "
-                            f"stations on freeways/arterials capturing through-traffic "
-                            f"from origins/destinations outside the modeled area. "
-                            f"{num_below_10} station(s) have sim < 10% of "
-                            f"observed - characteristic of boundary stations. "
-                            f"Recommended actions: (1) exclude boundary stations from the "
-                            f"evaluation, (2) expand the modeled region if external trips "
-                            f"dominate, (3) accept the gap as inherent to a geographically "
-                            f"bounded simulation. Do NOT raise scaling_factor."
-                        ),
-                    })
-                # In both yield-passes branches, do not set needs_more_demand.
-            else:
-                # Yield is below 0.85. Only fire the demand bump if iqr also
-                # confirms widespread under-simulation, not just outliers.
-                if not iqr_passes:
-                    actual_fraction = max(yield_ratio, 0.1)
-                    demand_multiplier = min(1.0 / actual_fraction, 10.0)
-                    needs_more_demand = True
-                    recommendations.append({
-                        "parameter": "_info.experiment_under_demand",
-                        "current": (
-                            f"yield={yield_ratio:.0%}, iqr_mean={iqr_mean_used:.0%}, "
-                            f"mean_pct_error={mean_pct_error:.1f}%, GEH<5={geh_lt_5:.1f}%"
-                        ),
-                        "recommended": f"yield >= {YIELD_GATE:.0%} AND iqr_mean >= {IQR_GATE:.0%}",
-                        "reason": (
-                            f"Both gates failed: simulated trip volume is "
-                            f"{(1-yield_ratio):.0%} below the survey benchmark AND "
-                            f"the interquartile-mean station ratio is "
-                            f"{iqr_mean_used:.0%}. Demand multiplier "
-                            f"~{demand_multiplier:.1f}x needed to close the volume gap."
-                        ),
-                    })
-                else:
-                    # Yield low but stations look fine - probably scaling factor
-                    # is too high relative to true trips/capita, or the survey
-                    # benchmark is mis-estimated. Either way, do not auto-bump.
-                    recommendations.append({
-                        "parameter": "_info.yield_low_stations_ok",
-                        "current": (
-                            f"yield={yield_ratio:.0%} (low) but "
-                            f"iqr_mean={iqr_mean_used:.0%} (stations OK)"
-                        ),
-                        "recommended": "manual review of survey_trips_per_capita and scaling_factor",
-                        "reason": (
-                            f"Trip volume is below survey expectation but the station "
-                            f"counts look reasonable. This is unusual - the survey "
-                            f"benchmark may be too high for this region, OR the plan "
-                            f"generator is failing to produce some plans. No automatic "
-                            f"scaling-factor change is recommended; investigate manually."
-                        ),
-                    })
+            if not iqr_ok:
+                # Counts say there is room for more agents — but only as far
+                # as measured simulation losses justify. The sf math after
+                # the rate-levers section caps the change at +0.03 absolute
+                # and 0.13 ceiling (i.e. stays in the ~10% sample band).
+                needs_more_demand = True
+
+            if iqr_catastrophic:
+                # Loud diagnostic: the auto-bump only compensates for plan-gen
+                # and stuck-agent losses. The implied raw multiplier from
+                # counts is much larger and is almost certainly NOT something
+                # to chase by inflating sf beyond ~13%.
+                raw_multiplier = 1.0 / iqr_mean_used if iqr_mean_used > 0 else float("inf")
+                recommendations.append({
+                    "parameter": "_info.user_review_required",
+                    "current": (
+                        f"iqr_mean={iqr_mean_used:.0%} (catastrophic), "
+                        f"raw multiplier implied by counts ~{raw_multiplier:.1f}x"
+                    ),
+                    "recommended": "manual decision on scaling_factor",
+                    "reason": (
+                        f"USER REVIEW REQUIRED. Counts indicate sim is at "
+                        f"{iqr_mean_used:.0%} of observed volumes region-wide "
+                        f"(raw multiplier ~{raw_multiplier:.1f}x). The auto-recommended "
+                        f"sf change ONLY compensates for measured plan-generation "
+                        f"and stuck-agent losses (typical 1.05-1.30x range) — it "
+                        f"does NOT and SHOULD NOT try to close the {raw_multiplier:.1f}x "
+                        f"gap. scaling_factor is the sample fraction of the resident "
+                        f"population; inflating it past ~13% over-represents residents "
+                        f"to compensate for things that aren't residents: "
+                        f"(1) external / through-traffic, (2) freight and commercial "
+                        f"vehicles, (3) non-resident trips, (4) the survey under-"
+                        f"estimating local daily activity. If you decide a larger sf "
+                        f"is justified, you MUST raise flowCapacityFactor and "
+                        f"storageCapacityFactor in lockstep (flow=sf, storage~=sf*1.2) "
+                        f"or the network will gridlock — review the run manually."
+                    ),
+                })
+            elif not iqr_ok:
+                # Moderate: just say what's happening, no loud header needed.
+                recommendations.append({
+                    "parameter": "_info.iqr_moderate_low",
+                    "current": f"iqr_mean={iqr_mean_used:.0%} (moderate)",
+                    "recommended": "small sf compensation bump",
+                    "reason": (
+                        f"Counts are moderately below sim ({iqr_mean_used:.0%} "
+                        f"interquartile mean). Applying compensation-only sf bump "
+                        f"for measured plan-gen / stuck-agent losses; see sf "
+                        f"recommendation below."
+                    ),
+                })
 
     # Two distinct kinds of "needs adjustment":
     #   A) tpc < target_low                — sim under-generates trips/agent;
@@ -1614,75 +1763,70 @@ def recommend_adjustments(
                 })
 
     # --- Lever 4: scaling_factor ---
-    # Experiment-driven path uses the measured demand_multiplier; rate-driven
-    # path uses the residual gap after rate bumps.
+    # Two ways the sf can need to move:
+    #   (a) needs_more_demand from the counts gate above: compensate for
+    #       *measured* simulation losses (plan-gen + stuck) only. Capped
+    #       hard at +0.03 absolute step and 0.13 absolute ceiling so we
+    #       stay in the "~10% sample" band. This is intentionally too
+    #       small to close a large count gap; large gaps are reported via
+    #       _info.user_review_required and left to the user.
+    #   (b) Rate-levers path (tpc too low): the rate bumps above raise
+    #       trips/capita; if a residual gap remains, nudge sf up by the
+    #       same small amount and capped the same way.
+    SF_STEP_MAX = 0.03   # max absolute step per iteration
+    SF_CEILING = 0.13    # max absolute sf value the estimator will write
+
     current_sf = estimate["scaling"]["scaling_factor"]
 
     if needs_more_demand:
-        # Fix #6: exponent depends on capacity-factor regime.
-        #   - Balanced caps (cap_ratio ≈ 1): more agents produce ~proportionally
-        #     more link volume, so the SF multiplier should be near 1:1 with
-        #     the measured demand multiplier.
-        #   - Over-provisioned caps (cap_ratio > 1): adding agents has
-        #     compounding effect (less crowding-out), so dampen the SF
-        #     multiplier to avoid overshooting.
-        #   - Under-provisioned caps (cap_ratio < 1): congestion already
-        #     limits throughput; raising SF alone won't help proportionally.
-        if 0.95 <= cap_ratio <= 1.05:
-            sf_exponent = 0.85
-        elif cap_ratio > 1.05:
-            sf_exponent = 0.45  # was 0.35 — slightly less aggressive damping
-        else:
-            sf_exponent = 0.70  # tighter caps: SF gives diminishing returns
-        sf_mult_raw = demand_multiplier ** sf_exponent
-
-        # Fix #7: compensate for measured plan-generator yield. If only
-        # 81% of estimator-predicted plans actually get generated, we need
-        # to ask for ~1/0.81 = 1.23x more so the deployed count hits the
-        # target. plan_gen_ratio defaults to 1.0 (no compensation) when
-        # we don't have a measurement.
-        yield_compensation = 1.0 / plan_gen_ratio if plan_gen_ratio > 0 else 1.0
-        sf_mult = min(sf_mult_raw * yield_compensation, 3.0)
-        new_sf = round(min(current_sf * sf_mult, 1.0), 3)
+        # Compensation = inverse of the measured deployment yield.
+        # plan_gen_ratio  = generated_plans / estimated_plans   (typically 0.7-1.0)
+        # stuck_fraction  = stuck_agents   / simulated_persons   (typically 0-0.05)
+        deployment_yield = max(plan_gen_ratio * (1.0 - stuck_fraction), 0.5)
+        sf_compensation = 1.0 / deployment_yield
+        proposed_sf = current_sf * sf_compensation
     else:
-        # Purely trips/capita driven (Path A continued).
+        # Rate-levers path: compute residual tpc gap after rate bumps.
         new_total_rate = sum(min(r * rate_multiplier, 0.50) for r in current_rates.values())
         projected_nonwork_plans = effective_nonwork_pop * new_total_rate * effective_share
         projected_nonwork_trips = projected_nonwork_plans * avg_legs_nonwork
         projected_total_trips = work_trips + projected_nonwork_trips
         projected_tpc = projected_total_trips / total_pop if total_pop > 0 else 0
-
-        if projected_tpc < target_low:
-            remaining_gap = target / projected_tpc if projected_tpc > 0 else 2.0
-            new_sf = round(min(current_sf * remaining_gap, 1.0), 3)
+        if projected_tpc < target_low and projected_tpc > 0:
+            proposed_sf = current_sf * (target / projected_tpc)
         else:
-            new_sf = current_sf  # no scaling change needed
+            proposed_sf = current_sf
 
-    if new_sf > current_sf:
+    # Apply the band: never more than +SF_STEP_MAX above current, and never
+    # above the SF_CEILING absolute cap.
+    capped_sf = min(proposed_sf, current_sf + SF_STEP_MAX, SF_CEILING)
+    new_sf = round(capped_sf, 3)
+
+    if new_sf > current_sf + 0.001:
         if needs_more_demand:
             reason = (
-                f"Experiment shows volumes ~{(1 - 1/demand_multiplier):.0%} below "
-                f"observed (demand multiplier {demand_multiplier:.2f}x). "
-                f"SF multiplier = {demand_multiplier:.2f}^{sf_exponent:.2f} "
-                f"x (1/{plan_gen_ratio:.2f} plan-gen yield) "
-                f"= {sf_mult:.2f}x -> {current_sf:.3f} -> {new_sf:.3f}. "
-                f"countsScaleFactor will auto-adjust to 1/{new_sf} = {1/new_sf:.1f}. "
-                f"WARNING: qsim.flowCapacityFactor ({flow_cap}) and qsim.storageCapacityFactor "
-                f"({storage_cap}) are UNCHANGED, leaving cap_ratio={cap_ratio:.2f}x. "
-                f"At scaling_factor={new_sf:.3f} with capacity at {flow_cap}, agents will "
-                f"compete for less capacity than they need, producing artificial congestion, "
-                f"stuck agents, and a different equilibrium. If you accept this recommendation "
-                f"you should ALSO raise flowCapacityFactor and storageCapacityFactor in lockstep "
-                f"(target: flow ~ {new_sf:.3f}, storage ~ {new_sf*1.2:.3f}). This estimator does "
-                f"not auto-adjust capacity because doubling SF and capacity together also doubles "
-                f"simulation cost; the decision is left to you."
+                f"Compensation-only sf bump: deployment_yield = "
+                f"plan_gen_ratio({plan_gen_ratio:.2f}) * (1 - stuck_fraction"
+                f"({stuck_fraction:.3f})) = {plan_gen_ratio * (1 - stuck_fraction):.2f}; "
+                f"sf_compensation = 1/{plan_gen_ratio * (1 - stuck_fraction):.2f} = "
+                f"{1.0 / max(plan_gen_ratio * (1 - stuck_fraction), 0.5):.2f}x. "
+                f"Proposed sf {current_sf:.3f} -> {proposed_sf:.3f}, capped to "
+                f"{new_sf:.3f} (max step +{SF_STEP_MAX}, ceiling {SF_CEILING}). "
+                f"flowCapacityFactor ({flow_cap}) and storageCapacityFactor "
+                f"({storage_cap}) are UNCHANGED — that's by design: sf only "
+                f"recovers measured losses, so capacity should still match the "
+                f"original sample fraction. countsScaleFactor will auto-adjust "
+                f"to 1/{new_sf} = {1/new_sf:.1f}. This bump does NOT try to "
+                f"close any count gap beyond loss compensation; see "
+                f"_info.user_review_required if iqr_mean is catastrophic."
             )
         else:
             reason = (
                 f"Increase scaling to close residual trips/capita gap "
-                f"(from {current_sf:.0%} to {new_sf:.0%} of population). "
-                f"Capacity factors unchanged. "
-                f"countsScaleFactor will auto-adjust to 1/{new_sf} = {1/new_sf:.1f}."
+                f"(from {current_sf:.3f} to {new_sf:.3f}). Capped to "
+                f"+{SF_STEP_MAX} per step, ceiling {SF_CEILING}. Capacity "
+                f"factors unchanged. countsScaleFactor will auto-adjust to "
+                f"1/{new_sf} = {1/new_sf:.1f}."
             )
         recommendations.append({
             "parameter": "plan_generation.scaling_factor",
@@ -1989,8 +2133,9 @@ def print_scorecard(
                 print(f"    {fips:<8} {cd['workers']:>10,} {cd['transit_share']:>7.1%} "
                       f"{cd['bus_share']:>7.1%} {cd['rail_share']:>7.1%}")
 
-        if tc.get("scaling_factor") and tc["scaling_factor"] > 0:
-            print(f"\n    Recommended scaling_factor:   {tc['scaling_factor']}")
+        # Transit calibration intentionally does not recommend a scaling_factor;
+        # see compute_transit_calibration docstring. Any sf change comes from
+        # the counts-driven path in recommend_adjustments.
 
     # --- Section 7: Previous experiment feedback ---
     if experiment_feedback:
@@ -2123,11 +2268,23 @@ def main():
     parser = argparse.ArgumentParser(
         description="Demand estimator - pre-run calibration tool for MATSim experiments"
     )
-    parser.add_argument("config_file", help="Path to config JSON file (e.g. config/USA/TwinCities/config_twin.json)")
-    parser.add_argument("--no-acs", action="store_true", help="Skip Census ACS API calls")
+    parser.add_argument(
+        "config_or_region",
+        help="Cold start: path to config JSON (e.g. config/USA/TwinCities/config_twin.json). "
+             "Feedback (with --experiment-dir): path to the region folder "
+             "(e.g. config/USA/TwinCities) - the estimator reads "
+             "<experiment-dir>/config_used.json as the state to update.",
+    )
     parser.add_argument("--experiment-dir", type=str, default=None,
-                        help="Path to a previous experiment folder to compare against")
+                        help="Path to a previous experiment folder. When given, the "
+                             "positional arg must be a region folder; the estimator "
+                             "reads <experiment-dir>/config_used.json and writes "
+                             "<region_folder>/config_estimated.json.")
     args = parser.parse_args()
+
+    read_from, output_path = resolve_estimator_inputs(
+        args.config_or_region, args.experiment_dir
+    )
 
     # Set up log file in logs/ directory
     logs_dir = project_root / "logs"
@@ -2137,25 +2294,25 @@ def main():
     tee = TeeWriter(log_path)
     sys.stdout = tee
 
-    # Load config
-    config_path = Path(args.config_file)
-    if not config_path.is_file():
-        print(f"ERROR: Config file not found: {config_path}")
-        sys.exit(1)
-
-    with open(config_path, "r") as f:
+    # Load config from the resolved source (base config or experiment's
+    # config_used.json). The write-back target lives in the region folder.
+    with open(read_from, "r") as f:
         config = json.load(f)
 
-    # Store config dir for relative path resolution
-    config["_config_dir"] = str(config_path.parent)
+    # _config_dir must point at the region folder (where the estimated config
+    # will live), not at the experiment folder, so relative paths in the JSON
+    # resolve against the region. config_used.json already has absolute paths.
+    region_dir = output_path.parent
+    config["_config_dir"] = str(region_dir)
 
     # Resolve relative data_dir to absolute (same logic as run_experiment.py)
     data_dir = config.get("data", {}).get("data_dir", "")
     if data_dir and not Path(data_dir).is_absolute():
-        resolved = (config_path.parent / data_dir).resolve()
+        resolved = (region_dir / data_dir).resolve()
         config["data"]["data_dir"] = str(resolved)
 
-    print(f"Loaded config: {config_path}")
+    print(f"Loaded config: {read_from}")
+    print(f"Output target: {output_path}")
     counties = config.get("region", {}).get("counties", [])
     print(f"Region: {len(counties)} counties")
 
@@ -2171,22 +2328,16 @@ def main():
     survey_trips_per_capita = tpc_data["blended"]
 
     # --- Step 2: Fetch Census ACS data (mode share, cross-check) ---
+    # ACS is required for both estimators; refuse to run without a key, and
+    # treat an empty / low-coverage fetch as a hard error so the estimator
+    # never writes config_estimated.json from bogus zero data.
+    api_key = require_acs_key(config, read_from)
     acs_data: Dict[str, Dict[str, int]] = {}
-    api_key = config.get("data", {}).get("census_api_key", "")
-
-    acs_coverage_ok = True
-    if not args.no_acs and counties:
+    if counties:
         print()
         print("-" * 70)
         print("  STEP 2: FETCHING CENSUS ACS DATA (cross-check)")
         print("-" * 70)
-        if not api_key:
-            print("  NOTE: no census_api_key in config - attempting fetch anyway.")
-            print("        The Census ACS endpoint normally requires a key; the call")
-            print("        will likely return 'Missing Key' HTML and Step 2b transit")
-            print("        calibration will be skipped. Add 'census_api_key' under")
-            print("        'data' in config.json to enable. Get a free key at:")
-            print("        https://api.census.gov/data/key_signup.html")
         print(f"  [Source: Census ACS 5-year B08301 API, year={ACS_YEAR}]")
         print(f"  Fetching commute mode data for {len(counties)} counties...")
         acs_data = fetch_acs_commute_data(counties, api_key)
@@ -2194,23 +2345,15 @@ def main():
         print(f"  Retrieved data for {len(acs_data)}/{len(counties)} counties "
               f"({coverage:.0%} coverage)")
         if coverage < 0.5:
-            acs_coverage_ok = False
-            missing = sorted(set(counties) - set(acs_data.keys()))
-            print(f"  !! LOW COVERAGE: only {coverage:.0%} of configured counties returned ACS data.")
-            print(f"  !! Missing counties: {', '.join(missing)}")
-            print(f"  !! Transit calibration will be SKIPPED to avoid mis-tuning the region")
-            print(f"  !! based on a non-representative sample.")
-            if not api_key:
-                print(f"  !! ROOT CAUSE: no census_api_key in config (see NOTE above).")
-            else:
-                print(f"  !! Re-run when the API is reachable, or pass --no-acs to suppress this step.")
+            _print_acs_coverage_error(counties, list(acs_data.keys()))
+            sys.exit(3)
 
     # --- Load previous experiment feedback up-front so Step 2b can use the
     # empirical chain_reduction. Display of the feedback summary still happens
     # under "STEP 3" below to keep the user-visible step order stable. ---
     experiment_feedback = None
     if args.experiment_dir:
-        exp_dir = Path(args.experiment_dir)
+        exp_dir = _resolve_experiment_dir(args.experiment_dir)
         summary_file = exp_dir / "experiment_summary.json"
         if summary_file.is_file():
             try:
@@ -2232,8 +2375,9 @@ def main():
     empirical_chain_reduction = compute_empirical_chain_reduction(experiment_feedback)
 
     # --- Step 2b: Transit calibration from ACS bus/rail breakdown ---
+    # acs_data is guaranteed non-empty here: Step 2 exits on low coverage.
     transit_calibration = None
-    if acs_data and acs_coverage_ok:
+    if acs_data:
         print()
         print("-" * 70)
         print("  STEP 2b: TRANSIT CALIBRATION FROM ACS BUS/RAIL DATA")
@@ -2304,33 +2448,14 @@ def main():
         experiment_feedback=experiment_feedback,
     )
 
-    # Merge transit calibration recommendations
-    # Transit recs handle modes.bus.* and modes.rail.* parameters;
+    # Merge transit calibration recommendations.
+    # Transit recs handle modes.bus.* and modes.rail.* parameters only;
     # demand recs handle nonwork_purposes.* and plan_generation.scaling_factor.
-    # If both transit calibration and demand adjustment recommend scaling_factor,
-    # keep the larger value (more conservative — produces more agents).
+    # Since transit calibration no longer touches scaling_factor (see
+    # compute_transit_calibration docstring), there is no sf conflict to
+    # resolve — just append the transit recs.
     if transit_calibration and transit_calibration.get("recommendations"):
-        transit_recs = transit_calibration["recommendations"]
-        # Check for scaling_factor conflict
-        demand_sf_rec = next(
-            (r for r in recommendations if r["parameter"] == "plan_generation.scaling_factor"),
-            None,
-        )
-        transit_sf_rec = next(
-            (r for r in transit_recs if r["parameter"] == "plan_generation.scaling_factor"),
-            None,
-        )
-        if demand_sf_rec and transit_sf_rec:
-            # Keep the larger scaling_factor, remove the transit one
-            if transit_sf_rec["recommended"] > demand_sf_rec["recommended"]:
-                demand_sf_rec["recommended"] = transit_sf_rec["recommended"]
-                demand_sf_rec["reason"] += (
-                    f" (also adjusted for transit shift: {transit_sf_rec['reason']})"
-                )
-            transit_recs = [r for r in transit_recs
-                           if r["parameter"] != "plan_generation.scaling_factor"]
-
-        recommendations.extend(transit_recs)
+        recommendations.extend(transit_calibration["recommendations"])
 
     # --- Step 7: Print scorecard ---
     print_scorecard(
@@ -2354,9 +2479,7 @@ def main():
             survey_trips_per_capita, acs_data=acs_data,
         )
 
-        # Write output config
-        stem = config_path.stem
-        output_path = config_path.with_name(f"{stem}_estimated{config_path.suffix}")
+        # Write output config (path resolved up-front by resolve_estimator_inputs)
         with open(output_path, "w") as f:
             json.dump(new_config, f, indent=2)
         print(f"Estimated config written to: {output_path}")

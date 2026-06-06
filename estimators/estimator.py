@@ -15,9 +15,13 @@ Running the orchestrator is equivalent to running both sub-estimators
 individually but with a single command and a combined summary at the end.
 
 Usage:
+    # Cold start - positional is the base config JSON
     python estimators/estimator.py config/USA/TwinCities/config_twin.json
-    python estimators/estimator.py config/USA/TwinCities/config_twin.json --no-acs
-    python estimators/estimator.py config/USA/TwinCities/config_twin.json --experiment-dir E:/jetstream2_experiments/april2026/experiment_20260430_121156
+
+    # Feedback - positional is the region FOLDER; the estimator reads
+    # <experiment-dir>/config_used.json and writes <region>/config_estimated.json
+    python estimators/estimator.py config/USA/TwinCities \
+        --experiment-dir E:/jetstream2_experiments/april2026/experiment_20260430_121156
 
 The --experiment-dir flag is forwarded to BOTH sub-estimators:
   - demand_estimator uses it to load experiment_summary.json and tune demand.
@@ -26,6 +30,7 @@ The --experiment-dir flag is forwarded to BOTH sub-estimators:
 """
 
 import argparse
+import json
 import subprocess
 import sys
 from datetime import datetime
@@ -35,6 +40,8 @@ project_root = Path(__file__).parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
+from estimators.demand_estimator import resolve_estimator_inputs
+
 
 def _run(script: Path, config_file: str, extra_args: list) -> int:
     """Run a sub-estimator script and stream its output. Returns exit code."""
@@ -43,18 +50,40 @@ def _run(script: Path, config_file: str, extra_args: list) -> int:
     return result.returncode
 
 
+def _require_acs_key(positional: str, experiment_dir: str | None) -> None:
+    """Single point of truth: refuse to run either estimator without a Census
+    ACS key. The key is read from the same config the sub-estimators will read,
+    so what we check here is exactly what they will use.
+    """
+    read_from, _ = resolve_estimator_inputs(positional, experiment_dir)
+    with open(read_from, "r") as f:
+        config = json.load(f)
+    api_key = (config.get("data", {}).get("census_api_key", "") or "").strip()
+    if not api_key:
+        print("=" * 70, file=sys.stderr)
+        print("  ERROR: census_api_key missing from config.", file=sys.stderr)
+        print("=" * 70, file=sys.stderr)
+        print(
+            f"  Config read: {read_from}\n"
+            f"  Both estimators rely on Census ACS B08301 (mode share) data.\n"
+            f"  Without a key the demand estimator cannot calibrate transit\n"
+            f"  parameters and the mode-share estimator cannot compute targets;\n"
+            f"  the resulting config_estimated.json would be unsafe to apply.\n"
+            f"  Add 'census_api_key' under 'data' in config.json.\n"
+            f"  Free key signup: https://api.census.gov/data/key_signup.html",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Estimator orchestrator — runs demand and mode share estimators"
     )
     parser.add_argument(
-        "config_file",
-        help="Path to config JSON (e.g. config/USA/TwinCities/config_twin.json)",
-    )
-    parser.add_argument(
-        "--no-acs",
-        action="store_true",
-        help="Skip Census ACS API calls in both sub-estimators",
+        "config_or_region",
+        help="Cold start: path to config JSON. Feedback (with --experiment-dir): "
+             "path to the region folder. See module docstring for examples.",
     )
     parser.add_argument(
         "--experiment-dir",
@@ -81,8 +110,14 @@ def main() -> None:
     print("=" * 70)
     print("  ESTIMATOR ORCHESTRATOR")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  Config: {args.config_file}")
+    print(f"  Input : {args.config_or_region}")
+    if args.experiment_dir:
+        print(f"  Mode  : FEEDBACK (--experiment-dir {args.experiment_dir})")
+    else:
+        print(f"  Mode  : COLD START")
     print("=" * 70)
+
+    _require_acs_key(args.config_or_region, args.experiment_dir)
 
     results = {}
 
@@ -95,11 +130,9 @@ def main() -> None:
         print("  RUNNING: demand_estimator")
         print("=" * 70)
         extra = []
-        if args.no_acs:
-            extra.append("--no-acs")
         if args.experiment_dir:
             extra += ["--experiment-dir", args.experiment_dir]
-        rc = _run(demand_script, args.config_file, extra)
+        rc = _run(demand_script, args.config_or_region, extra)
         results["demand_estimator"] = "OK" if rc == 0 else f"FAILED (exit {rc})"
         if rc != 0:
             print(f"\n!! demand_estimator exited with code {rc}")
@@ -115,11 +148,9 @@ def main() -> None:
         print("  RUNNING: mode_share_estimator")
         print("=" * 70)
         extra = []
-        if args.no_acs:
-            extra.append("--no-acs")
         if args.experiment_dir:
             extra += ["--experiment-dir", args.experiment_dir]
-        rc = _run(mode_share_script, args.config_file, extra)
+        rc = _run(mode_share_script, args.config_or_region, extra)
         results["mode_share_estimator"] = "OK" if rc == 0 else f"FAILED (exit {rc})"
         if rc != 0:
             print(f"\n!! mode_share_estimator exited with code {rc}")
@@ -135,9 +166,13 @@ def main() -> None:
     print("=" * 70)
     for name, status in results.items():
         print(f"  {name:<30}  {status}")
-    config_path = Path(args.config_file)
-    stem = config_path.stem
-    estimated = config_path.with_name(f"{stem}_estimated{config_path.suffix}")
+    pos = Path(args.config_or_region)
+    if args.experiment_dir:
+        estimated = pos / "config_estimated.json"
+    elif pos.stem.endswith("_estimated"):
+        estimated = pos
+    else:
+        estimated = pos.with_name(f"{pos.stem}_estimated{pos.suffix}")
     print()
     print("  Outputs (if estimators succeeded):")
     print(f"    {estimated}")

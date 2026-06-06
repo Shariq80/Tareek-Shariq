@@ -63,6 +63,10 @@ from estimators.demand_estimator import (
     TeeWriter,
     fetch_acs_commute_data,
     apply_recommendations,
+    resolve_estimator_inputs,
+    require_acs_key,
+    _print_acs_coverage_error,
+    _resolve_experiment_dir,
 )
 
 # ---------------------------------------------------------------------------
@@ -633,20 +637,13 @@ def build_router_feedback_recommendations(
 
 def update_estimated_config(
     config: Dict[str, Any],
-    config_path: Path,
+    estimated_path: Path,
     recommendations: List[Dict[str, Any]],
 ) -> Path:
-    stem = config_path.stem
-    # If the user passed in an already-estimated file (...
-    # config_estimated.json), write back to the same path rather than
-    # appending another _estimated suffix. This is what enables chaining
-    # across runs: each invocation reads the prior estimated.json and
-    # updates it in place.
-    if stem.endswith("_estimated"):
-        estimated_path = config_path
-    else:
-        estimated_path = config_path.with_name(f"{stem}_estimated{config_path.suffix}")
-
+    """Apply recommendations to the existing estimated config (or to `config`
+    if no prior estimated file exists) and write to estimated_path. Merging
+    onto an existing file preserves sibling-estimator adjustments from the
+    same run (demand writes first, then mode-share)."""
     if estimated_path.exists():
         with open(estimated_path) as f:
             base = json.load(f)
@@ -656,6 +653,7 @@ def update_estimated_config(
         print(f"  Creating new estimated config: {estimated_path.name}")
 
     new_config = apply_recommendations(base, recommendations)
+    new_config.pop("_config_dir", None)
 
     with open(estimated_path, "w") as f:
         json.dump(new_config, f, indent=2)
@@ -672,22 +670,20 @@ def main() -> None:
         description="Mode share estimator - calibrate MATSim scoring params from ACS and prior experiments"
     )
     parser.add_argument(
-        "config_file",
-        help="Path to config JSON (e.g. config/USA/Birmingham_AL/config.json)",
+        "config_or_region",
+        help="Cold start: path to config JSON (e.g. config/USA/Birmingham_AL/config.json). "
+             "Feedback (with --experiment-dir): path to the region folder - the "
+             "estimator reads <experiment-dir>/config_used.json as the state to update.",
     )
     parser.add_argument(
         "--experiment-dir",
         type=str,
         default=None,
-        help="Path to a prior experiment folder. When provided, the estimator reads "
-             "modestats.csv (realised mode shares) and config.xml (current params) "
-             "from this folder and applies a clamped log-ratio correction toward "
-             "the ACS target. Without this flag, the estimator runs in cold-start "
-             "mode and uses MATSim's documented defaults as the 'current' values.",
-    )
-    parser.add_argument(
-        "--no-acs", action="store_true",
-        help="Skip Census ACS API call (offline; uses zero ACS shares)",
+        help="Path to a prior experiment folder. When provided, the positional arg "
+             "must be a region folder. The estimator reads modestats.csv and "
+             "config.xml from this folder for the feedback signal, reads "
+             "config_used.json as the state to update, and writes "
+             "<region_folder>/config_estimated.json.",
     )
     args = parser.parse_args()
 
@@ -703,15 +699,15 @@ def main() -> None:
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 70)
 
-    config_path = Path(args.config_file)
-    if not config_path.is_file():
-        print(f"ERROR: Config file not found: {config_path}")
-        sys.exit(1)
+    read_from, output_path = resolve_estimator_inputs(
+        args.config_or_region, args.experiment_dir
+    )
 
-    with open(config_path) as f:
+    with open(read_from) as f:
         config = json.load(f)
 
-    print(f"\nLoaded config : {config_path}")
+    print(f"\nLoaded config : {read_from}")
+    print(f"Output target : {output_path}")
     counties = config.get("region", {}).get("counties", [])
     print(f"Region        : {len(counties)} counties")
 
@@ -730,10 +726,7 @@ def main() -> None:
     current_source: str
 
     if args.experiment_dir:
-        exp_dir = Path(args.experiment_dir)
-        if not exp_dir.is_dir():
-            print(f"ERROR: --experiment-dir does not exist: {exp_dir}")
-            sys.exit(1)
+        exp_dir = _resolve_experiment_dir(args.experiment_dir)
 
         sim_shares = _read_modestats_final(exp_dir)
         if sim_shares is None:
@@ -779,27 +772,23 @@ def main() -> None:
     print("  STEP 2: FETCH ACS B08301 COMMUTE MODE DATA")
     print("-" * 70)
 
+    # ACS is required: without real targets the clamped log-ratio update
+    # would drive pt/walk constants toward zero shares, corrupting the
+    # config. require_acs_key() exits if the key is missing, and a low-
+    # coverage fetch is treated the same way.
+    api_key = require_acs_key(config, read_from)
     acs_data: Dict[str, Dict[str, int]] = {}
-    if args.no_acs:
-        print("  --no-acs: skipping Census API call. ACS shares = 0.")
-    else:
-        api_key = config.get("data", {}).get("census_api_key", "") or config.get("census_api_key", "")
-        if not api_key:
-            print("  NOTE: no census_api_key in config - proceeding without key")
-        fips_list = [c for c in counties if isinstance(c, str)]
-        if fips_list:
-            print(f"  Fetching ACS for {len(fips_list)} counties ...")
-            acs_data = fetch_acs_commute_data(fips_list, api_key)
-            print(f"  Received data for {len(acs_data)}/{len(fips_list)} counties")
+    fips_list = [c for c in counties if isinstance(c, str)]
+    if fips_list:
+        print(f"  Fetching ACS for {len(fips_list)} counties ...")
+        acs_data = fetch_acs_commute_data(fips_list, api_key)
+        print(f"  Received data for {len(acs_data)}/{len(fips_list)} counties")
+        coverage = len(acs_data) / len(fips_list)
+        if coverage < 0.5:
+            _print_acs_coverage_error(fips_list, list(acs_data.keys()))
+            sys.exit(3)
 
-    if acs_data:
-        acs = _aggregate_acs(acs_data)
-    else:
-        acs = {
-            "total_workers": 0, "transit_share": 0.0,
-            "bus_share": 0.0, "rail_share": 0.0,
-            "walk_share": 0.0, "car_share": 0.0,
-        }
+    acs = _aggregate_acs(acs_data)
 
     print()
     print(f"  Total workers (ACS)  : {acs['total_workers']:,}")
@@ -901,7 +890,7 @@ def main() -> None:
     print("-" * 70)
 
     if recommendations:
-        estimated_path = update_estimated_config(config, config_path, recommendations)
+        estimated_path = update_estimated_config(config, output_path, recommendations)
         print(f"  Written: {estimated_path}")
     else:
         estimated_path = None
