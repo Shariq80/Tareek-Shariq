@@ -115,6 +115,11 @@ class SurveyManager:
         self.config = config
         self.survey_configs: List[Dict] = config['data']['surveys']
         self.sources: Dict[str, BaseSurveyTrip] = {}
+        # Make sure every active survey is ingested into the DB before any
+        # load_data() call. ensure_surveys() is idempotent: it inspects the
+        # existing (source_type, source_year) pairs and only runs the ETL for
+        # sources that are missing.
+        ensure_surveys(config)
         self._init_sources()
 
     def _init_sources(self) -> None:
