@@ -160,8 +160,51 @@ def blend_survey_od_matrices(survey_ods: Dict[str, pd.DataFrame],
     return blended
 
 
+def _scale_and_round(matrix: pd.DataFrame, scale_to_total: int) -> pd.DataFrame:
+    """Scale *matrix* to *scale_to_total* and round so the total is exact.
+
+    Uses Hamilton's (largest-remainder) method to distribute the rounding
+    residual, guaranteeing the rounded matrix sums to exactly scale_to_total.
+    Operates on a writeable NumPy copy so it is safe even when the input
+    DataFrame's backing array is read-only.
+    """
+    total = matrix.sum().sum()
+    if total <= 0:
+        raise ValueError("Matrix sum is zero, cannot scale")
+
+    scale_factor = scale_to_total / total
+    logger.info(f"Matrix total before scaling: {total:,.0f}")
+    logger.info(f"Scale factor: {scale_factor:.6f}")
+    scaled = matrix * scale_factor
+
+    logger.info("Applying robust rounding to guarantee target total...")
+    floored = np.floor(scaled).astype(int)
+    fractional = (scaled - floored).to_numpy().flatten()
+
+    # Writeable copy: DataFrame.values can be a read-only view, so mutating
+    # `.values.flat` in place raises "assignment destination is read-only".
+    arr = floored.to_numpy().copy()
+    floored_total = int(arr.sum())
+    remainder = scale_to_total - floored_total
+
+    logger.info(f"Total after flooring: {floored_total:,.0f}")
+    logger.info(f"Remainder to distribute: {remainder:,.0f}")
+
+    if remainder > 0:
+        # Bump the cells with the largest fractional parts.
+        top_indices = np.argsort(-fractional)[:remainder]
+        arr.flat[top_indices] += 1
+    elif remainder < 0:
+        # Decrement the smallest-fraction cells, but only positive ones.
+        positive = np.where(arr.flatten() > 0)[0]
+        smallest_idx = positive[np.argsort(fractional[positive])[:abs(remainder)]]
+        arr.flat[smallest_idx] -= 1
+
+    return pd.DataFrame(arr, index=matrix.index, columns=matrix.columns)
+
+
 def combine_od_matrices(survey_od_matrix: pd.DataFrame,
-                       local_od_matrix: pd.DataFrame, 
+                       local_od_matrix: pd.DataFrame,
                        alpha: float,
                        scale_to_total: int | None = None) -> pd.DataFrame:
     """
@@ -197,6 +240,19 @@ def combine_od_matrices(survey_od_matrix: pd.DataFrame,
     logger.info(f"Alpha (survey weight): {alpha:.2f}")
     logger.info(f"Local weight: {1-alpha:.2f}")
 
+    # Guard: an empty or all-zero survey matrix means the survey contributed no
+    # OD pairs (e.g. survey data never ingested). The blend below would silently
+    # collapse to the local matrix, ignoring alpha. Make that explicit: warn and
+    # return the local matrix directly instead of pretending a blend happened.
+    if survey_od_matrix.empty or survey_od_matrix.to_numpy().sum() == 0:
+        logger.warning(
+            "Survey OD matrix is empty/all-zero — skipping survey blend and "
+            "returning the local matrix unchanged. Check that survey data was "
+            "ingested (alpha=%.2f will have no effect).", alpha
+        )
+        target = scale_to_total if scale_to_total is not None else int(local_od_matrix.sum().sum())
+        return _scale_and_round(local_od_matrix, target)
+
     # Align survey to local's structure (fill missing survey values with 0)
     logger.info("Aligning survey to local matrix structure...")
     survey_aligned = survey_od_matrix.reindex(index=local_od_matrix.index, 
@@ -222,50 +278,11 @@ def combine_od_matrices(survey_od_matrix: pd.DataFrame,
         logger.info(f"No scaling target specified. Using local matrix total: {scale_to_total:,.0f}")
     else:
         logger.info(f"Scaling to specified total: {scale_to_total:,.0f}")
-    
-    # Scale combined matrix to target total
+
+    # Scale combined matrix to target total and round to an exact integer total
     combined_total = combined.sum().sum()
-    if combined_total > 0:
-        scale_factor = scale_to_total / combined_total
-        logger.info(f"Combined matrix total before scaling: {combined_total:,.0f}")
-        logger.info(f"Scale factor: {scale_factor:.6f}")
-        combined = combined * scale_factor
-    else:
-        raise ValueError("Combined matrix sum is zero, cannot scale")
-    
-    # Robust rounding that guarantees target total (vectorized for speed)
-    # check Hamilton's method
-    logger.info("Applying robust rounding to guarantee target total...")
-    
-    # Step 1: Floor all values
-    combined_floor = np.floor(combined).astype(int)
-    
-    # Step 2: Calculate fractional parts
-    fractional = combined - combined_floor
-    
-    # Step 3: Calculate rounding remainder
-    floored_total = combined_floor.sum().sum()
-    remainder = scale_to_total - floored_total
-    
-    logger.info(f"Total after flooring: {floored_total:,.0f}")
-    logger.info(f"Remainder to distribute: {remainder:,.0f}")
-    
-    # Step 4: Vectorized rounding using argsort on flattened values
-    combined_rounded = combined_floor.copy()
-    frac_flat = fractional.values.flatten()
-    
-    if remainder > 0:
-        # Get indices of largest fractional parts
-        top_indices = np.argsort(-frac_flat)[:remainder]
-        combined_rounded.values.flat[top_indices] += 1
-    elif remainder < 0:
-        # Get indices of smallest fractional parts (only positive cells)
-        mask = combined_rounded.values.flatten() > 0
-        candidates = np.where(mask)[0]
-        frac_candidates = frac_flat[candidates]
-        smallest_idx = candidates[np.argsort(frac_candidates)[:abs(remainder)]]
-        combined_rounded.values.flat[smallest_idx] -= 1
-    
+    combined_rounded = _scale_and_round(combined, scale_to_total)
+
     # Verify
     logger.info("=" * 70)
     logger.info("VERIFICATION")
