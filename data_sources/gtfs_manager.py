@@ -1148,42 +1148,59 @@ class GTFSManager:
             return 0
 
         total = 0
-        chunk_size = 50_000
+        chunk_size = 200_000
         next_id = self._next_id_from_session(session, GTFSStopTime)
 
-        for chunk in pd.read_csv(st_path, dtype=str, chunksize=chunk_size):
-            objects = []
-            for _, row in chunk.iterrows():
-                trip_id = str(row.get('trip_id', ''))
-                stop_id = str(row.get('stop_id', ''))
+        # stop_times.txt is by far the largest GTFS file (millions of rows for a
+        # big feed). Build each chunk with vectorized pandas ops, then hand the
+        # whole DataFrame to DuckDB's native columnar ingest (INSERT ... SELECT
+        # from a registered DataFrame). This is dramatically faster than row-by-
+        # row ORM construction or parameterized executemany, which DuckDB binds
+        # one row at a time. Log per chunk so progress is visible.
+        table_name = GTFSStopTime.__table__.name
+        cols = ['id', 'feed_id', 'trip_pk', 'stop_pk',
+                'arrival_time', 'departure_time', 'stop_sequence']
+        col_list = ', '.join(cols)
 
-                trip_pk = trip_pk_map.get(trip_id)
-                stop_pk = stop_pk_map.get(stop_id)
+        # Raw DuckDB connection bound to this transaction (so it rolls back with
+        # the rest of the feed on failure).
+        duck_conn = session.connection().connection.driver_connection
 
-                if trip_pk is None or stop_pk is None:
-                    continue
+        for chunk_num, chunk in enumerate(pd.read_csv(st_path, dtype=str, chunksize=chunk_size), start=1):
+            # Map foreign keys vectorized; rows with an unmapped trip/stop drop out.
+            chunk['trip_pk'] = chunk['trip_id'].astype(str).map(trip_pk_map)
+            chunk['stop_pk'] = chunk['stop_id'].astype(str).map(stop_pk_map)
+            chunk = chunk[chunk['trip_pk'].notna() & chunk['stop_pk'].notna()]
+            if chunk.empty:
+                continue
 
-                seq_str = str(row.get('stop_sequence', '0'))
-                try:
-                    stop_sequence = int(seq_str)
-                except ValueError:
-                    stop_sequence = 0
+            n = len(chunk)
+            arrival = chunk.get('arrival_time', pd.Series(index=chunk.index, dtype=str))
+            departure = chunk.get('departure_time', pd.Series(index=chunk.index, dtype=str))
 
-                objects.append(GTFSStopTime(
-                    id=next_id,
-                    feed_id=feed_id,
-                    trip_pk=trip_pk,
-                    stop_pk=stop_pk,
-                    arrival_time=str(row.get('arrival_time', '')) or None,
-                    departure_time=str(row.get('departure_time', '')) or None,
-                    stop_sequence=stop_sequence,
-                ))
-                next_id += 1
+            insert_df = pd.DataFrame({
+                'id': range(next_id, next_id + n),
+                'feed_id': feed_id,
+                'trip_pk': chunk['trip_pk'].astype(int).to_numpy(),
+                'stop_pk': chunk['stop_pk'].astype(int).to_numpy(),
+                'arrival_time': arrival.where(arrival.astype(bool), None).to_numpy(),
+                'departure_time': departure.where(departure.astype(bool), None).to_numpy(),
+                'stop_sequence': pd.to_numeric(
+                    chunk.get('stop_sequence'), errors='coerce'
+                ).fillna(0).astype(int).to_numpy(),
+            })
 
-            if objects:
-                session.bulk_save_objects(objects)
-                session.flush()
-                total += len(objects)
+            # Register the DataFrame and let DuckDB ingest it columnar.
+            duck_conn.register('stop_times_chunk', insert_df)
+            duck_conn.execute(
+                f"INSERT INTO {table_name} ({col_list}) "
+                f"SELECT {col_list} FROM stop_times_chunk"
+            )
+            duck_conn.unregister('stop_times_chunk')
+
+            next_id += n
+            total += n
+            logger.info(f"    stop_times: loaded {total:,} rows (chunk {chunk_num})")
 
         return total
 
