@@ -1,6 +1,6 @@
 asttokens==3.0.0
 attrs==25.4.0
-bleach==6.3.0
+bleach==6.4.0
 bokeh==3.8.2
 branca==0.8.2
 certifi==2025.10.5
