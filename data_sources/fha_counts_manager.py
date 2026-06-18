@@ -66,24 +66,32 @@ class FHACountsManager:
             7: 'JUL', 8: 'AUG', 9: 'SEP', 10: 'OCT', 11: 'NOV', 12: 'DEC',
         }
 
-    def setup(self) -> bool:
+    def setup(self, rebuild: bool = False) -> bool:
         """
         Full ETL pipeline: extract from zips, filter, aggregate, load to DB.
+
+        Args:
+            rebuild: When True, clear any existing FHA data for the configured
+                states and re-run the ETL, even if data is already in the DB.
+                Use this to pick up changes to year/month or the county list.
 
         Returns:
             True if data was loaded successfully, False otherwise.
         """
         logger.info("Setting up FHA counts data...")
 
-        if self.has_data_for_region():
-            logger.info("FHA counts data already loaded in DB — skipping ETL")
-            return True
-
         # Determine which states/counties we need
         needed = self._get_needed_states()
         if not needed:
             logger.warning("FHA: no counties configured — cannot load FHA data")
             return False
+
+        if rebuild:
+            logger.info("FHA counts rebuild requested — clearing existing data and re-running ETL")
+            self._clear_region_data(needed)
+        elif self.has_data_for_region():
+            logger.info("FHA counts data already loaded in DB — skipping ETL")
+            return True
 
         # Find zip files
         station_zip = self.data_dir / f"{self.year}_station_data.zip"
@@ -170,6 +178,17 @@ class FHACountsManager:
             if not results:
                 return False
         return True
+
+    def _clear_region_data(self, needed: Dict[str, Set[str]]):
+        """Delete existing FHA stations and hourly volumes for the needed states.
+
+        Called on rebuild so stale rows (e.g. from a different year/month or a
+        wider county list) don't shadow a fresh ETL via has_data_for_region().
+        """
+        for state_fips in needed:
+            self.db_manager.delete_records(FHAHourlyVolume, filters={'state_code': state_fips})
+            self.db_manager.delete_records(FHAStation, filters={'state_code': state_fips})
+        logger.info(f"FHA: cleared existing data for state(s) {sorted(needed)}")
 
     def _get_needed_states(self) -> Dict[str, Set[str]]:
         """
