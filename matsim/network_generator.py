@@ -32,6 +32,11 @@ class NetworkGenerator:
         """
         self.config = config
         self.matsim_config = config.get('matsim', {})
+        # Max JVM heap (GB) for the pt2matsim network/GTFS generation
+        # subprocesses. Without an explicit -Xmx the JVM defaults to 1/4 of
+        # physical RAM, which OOMs on large OSM extracts. This is distinct
+        # from matsim.heap_size_gb, which sizes the simulation run (runner.py).
+        self.network_heap_size_gb = self.matsim_config.get('network_heap_size_gb', 4)
         self.downloader = OSMDownloader()
 
     def _get_enabled_transit_modes(self) -> list:
@@ -167,7 +172,7 @@ class NetworkGenerator:
 
         # Run NetworkCleaner
         cmd = [
-            'java',
+            'java', f'-Xmx{self.network_heap_size_gb}g',
             '-cp', str(jar_path),
             'org.matsim.run.NetworkCleaner',
             str(input_network.resolve()),
@@ -541,7 +546,7 @@ class NetworkGenerator:
 
         # Run the conversion using RunSimpleNetworkReaderJalal (with coordinate fix)
         cmd = [
-            'java',
+            'java', f'-Xmx{self.network_heap_size_gb}g',
             '-cp', str(jar_path),
             'org.matsim.contrib.osm.examples.RunSimpleNetworkReaderJalal',
             str(osm_file.resolve()),
@@ -729,7 +734,7 @@ class NetworkGenerator:
         self._write_osm_config_xml(osm_xml_file, output_path, coordinate_system, config_xml)
 
         cmd = [
-            'java', '-cp', str(jar_path),
+            'java', f'-Xmx{self.network_heap_size_gb}g', '-cp', str(jar_path),
             'org.matsim.pt2matsim.run.Osm2MultimodalNetwork',
             str(config_xml.resolve())
         ]
@@ -892,7 +897,7 @@ class NetworkGenerator:
             logger.info(f"  Converting feed: {feed.provider} ({feed_id})")
 
             cmd = [
-                'java', '-cp', str(jar_path),
+                'java', f'-Xmx{self.network_heap_size_gb}g', '-cp', str(jar_path),
                 'org.matsim.pt2matsim.run.Gtfs2TransitSchedule',
                 str(effective_feed_dir.resolve()),
                 sample_day,
@@ -1298,7 +1303,7 @@ class NetworkGenerator:
         )
 
         cmd = [
-            'java', '-cp', str(jar_path),
+            'java', f'-Xmx{self.network_heap_size_gb}g', '-cp', str(jar_path),
             'org.matsim.pt2matsim.run.PublicTransitMapper',
             str(config_xml.resolve())
         ]
