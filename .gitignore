@@ -26,3 +26,7 @@ data/gtfs
 data/networks
 data/osm_cache
 data/pygris_cache
+
+# Stray/nested duckdb copies and lock files
+data/db/db/
+*.duckdb.lock
