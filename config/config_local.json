@@ -142,7 +142,7 @@
   },
   "plan_generation": {
     "target_plans": "all",
-    "scaling_factor": 0.01,
+    "scaling_factor": 0.0001,
     "work_scaling_multiplier": 1.0,
     "random_seed": 42,
     "skip_if_exists": true,

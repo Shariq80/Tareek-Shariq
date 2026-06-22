@@ -19,6 +19,7 @@ Arguments:
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -161,16 +162,28 @@ def load_shared_nonwork_data(config: Dict) -> Dict:
 class ExperimentRunner:
     """Main experiment orchestrator combining plan generation and MATSim simulation"""
 
-    def __init__(self, config_path: Path, experiment_id: Optional[str] = None):
+    def __init__(self, config_path: Path, experiment_id: Optional[str] = None,
+                 experiments_root: Optional[Path] = None):
         """
         Initialize experiment runner
 
         Args:
             config_path: Path to configuration JSON file
             experiment_id: Optional custom experiment ID
+            experiments_root: Optional root directory under which the
+                experiment directory is created. Defaults to
+                project_root / 'experiments', overridable via the
+                TAREEK_EXPERIMENTS_ROOT env var. Lets tests redirect output
+                to a temp dir so real experiments are never touched.
         """
         self.config_path = Path(config_path)
         self.experiment_id = experiment_id or self._generate_experiment_id()
+        if experiments_root is not None:
+            self.experiments_root = Path(experiments_root)
+        else:
+            self.experiments_root = Path(
+                os.environ.get('TAREEK_EXPERIMENTS_ROOT', project_root / 'experiments')
+            )
         self.config = None
         self.validator = None
 
@@ -462,8 +475,7 @@ class ExperimentRunner:
         logger.info("="*60)
 
         # Create experiment directory
-        experiments_root = project_root / 'experiments'
-        self.experiment_dir = experiments_root / self.experiment_id
+        self.experiment_dir = self.experiments_root / self.experiment_id
 
         # Check if directory already exists
         dir_exists = self.experiment_dir.exists()
@@ -900,7 +912,7 @@ class ExperimentRunner:
                 if fha_weight > 0:
                     from data_sources.fha_counts_manager import FHACountsManager
                     fha_manager = FHACountsManager(self.config, db_manager)
-                    fha_success = fha_manager.setup()
+                    fha_success = fha_manager.setup(rebuild=rebuild)
                     if not fha_success:
                         logger.warning("FHA counts setup failed â€” continuing without FHA data")
                 else:
@@ -1547,6 +1559,14 @@ Examples:
         help='Generate plans but skip MATSim simulation'
     )
 
+    parser.add_argument(
+        '--experiments-root',
+        type=str,
+        default=None,
+        help='Root dir for experiment output (default: ./experiments, '
+             'or TAREEK_EXPERIMENTS_ROOT env var)'
+    )
+
     args = parser.parse_args()
 
     # Validate config file exists
@@ -1559,7 +1579,8 @@ Examples:
     try:
         runner = ExperimentRunner(
             config_path=config_path,
-            experiment_id=args.experiment_id
+            experiment_id=args.experiment_id,
+            experiments_root=Path(args.experiments_root) if args.experiments_root else None
         )
 
         runner.run(skip_simulation=args.skip_simulation)
