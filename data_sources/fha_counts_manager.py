@@ -4,7 +4,8 @@ FHA/TMAS Traffic Counts Manager
 Handles extraction, transformation, and loading of Federal Highway Administration
 Traffic Monitoring Analysis System (TMAS) data. Reads pipe-delimited .STA (station)
 and .VOL (volume) files from zip archives, filters by configured counties, aggregates
-to bidirectional hourly averages, and stores results in the database.
+to per-direction hourly averages (one row per station-direction), and stores results
+in the database.
 
 Follows the GTFSManager pattern: a manager with a setup() method called from
 run_experiment.py, with data cached in the DB so ETL only runs once per region.
@@ -38,6 +39,15 @@ STATE_FIPS_TO_ABBR = {
 
 # Opposite direction pairs per FHWA coding: 1=N, 2=NE, 3=E, 4=SE, 5=S, 6=SW, 7=W, 8=NW
 OPPOSITE_DIRS = {1: 5, 5: 1, 3: 7, 7: 3, 2: 6, 6: 2, 4: 8, 8: 4}
+
+
+class FHASchemaError(RuntimeError):
+    """Raised when the DB has the old (pre per-direction) FHA schema.
+
+    This is a fatal, user-actionable condition (run the migration) — callers
+    must NOT swallow it and continue, or the pipeline would silently run
+    without FHA validation against an incompatible DB.
+    """
 
 
 class FHACountsManager:
@@ -79,6 +89,11 @@ class FHACountsManager:
             True if data was loaded successfully, False otherwise.
         """
         logger.info("Setting up FHA counts data...")
+
+        # Schema guard: the FHA tables now key on travel_dir (per-direction).
+        # An old-shape table (pre per-direction) is incompatible — refuse to
+        # run rather than fail cryptically on insert.
+        self._check_schema()
 
         # Determine which states/counties we need
         needed = self._get_needed_states()
@@ -144,21 +159,58 @@ class FHACountsManager:
 
         volumes_combined = pd.concat(all_volumes, ignore_index=True)
 
-        # Aggregate to bidirectional hourly averages
-        agg_volumes = self._aggregate_to_bidirectional(volumes_combined)
+        # Aggregate to per-direction hourly averages (one row per station-direction)
+        agg_volumes = self._aggregate_by_direction(volumes_combined)
+        if agg_volumes.empty:
+            logger.warning("FHA: aggregation produced no volume rows — "
+                           "counts.xml will not be generated")
+            return False
 
-        # Filter stations to only those with volume data
-        stations_with_vol = stations_combined[
-            stations_combined['station_id'].isin(agg_volumes['station_id'].unique())
-        ].copy()
+        # Keep only station-directions that exist in BOTH the STA and VOL data
+        # (a direction in one file but not the other can't be used).
+        sta_keys = set(zip(stations_combined['station_id'], stations_combined['travel_dir']))
+        vol_keys = set(zip(agg_volumes['station_id'], agg_volumes['travel_dir']))
+        only_sta = sta_keys - vol_keys
+        only_vol = vol_keys - sta_keys
+        if only_sta:
+            logger.info(f"FHA: {len(only_sta)} station-directions in STA have no "
+                        f"volume data — skipped")
+        if only_vol:
+            logger.info(f"FHA: {len(only_vol)} station-directions in VOL have no "
+                        f"station metadata — skipped")
+        common = sta_keys & vol_keys
+
+        def _key_mask(df):
+            return df.apply(lambda r: (r['station_id'], r['travel_dir']) in common, axis=1)
+
+        stations_with_vol = stations_combined[_key_mask(stations_combined)].copy()
+        agg_volumes = agg_volumes[_key_mask(agg_volumes)].copy()
 
         # Load to DB
         self._load_to_db(stations_with_vol, agg_volumes)
 
-        logger.info(f"FHA: loaded {len(stations_with_vol)} stations, "
+        logger.info(f"FHA: loaded {len(stations_with_vol)} station-directions, "
                     f"{len(agg_volumes)} volume records for "
                     f"{len(self._get_needed_states())} state(s)")
         return True
+
+    def _check_schema(self):
+        """Refuse to run against a pre-per-direction FHA schema.
+
+        Older DBs have fha_stations / fha_hourly_volumes without a travel_dir
+        column. Inserting per-direction records there would fail or corrupt the
+        data, so we stop early and point to the migration script.
+        """
+        for table in ('fha_stations', 'fha_hourly_volumes'):
+            cols = self.db_manager.get_table_columns(table)
+            if cols and 'travel_dir' not in cols:
+                raise FHASchemaError(
+                    f"FHA table '{table}' uses the old (pre per-direction) schema "
+                    f"— missing 'travel_dir'. Run the migration first:\n"
+                    f"    python scripts/migrate_fha_perdirection.py\n"
+                    f"This drops and re-ingests the FHA tables in the new "
+                    f"per-direction format."
+                )
 
     def has_data_for_region(self) -> bool:
         """Check if FHA data is already loaded in the DB for the configured region.
@@ -249,11 +301,28 @@ class FHACountsManager:
         df['lat'] = df['latitude'].astype(float) / 1_000_000
         df['lon'] = -df['longitude'].astype(float) / 1_000_000
 
-        # Deduplicate: keep one row per station_id (multiple rows per lane/dir)
-        stations = df.drop_duplicates(subset='station_id', keep='first')
+        # Direction code: keep only cardinal directions (1=N,3=E,5=S,7=W).
+        # Diagonal codes (2/4/6/8) are rare and can't be matched to a single
+        # network link bearing reliably, so we drop them.
+        df['travel_dir'] = pd.to_numeric(df['travel_dir'], errors='coerce')
+        n_before = len(df)
+        df = df[df['travel_dir'].isin([1, 3, 5, 7])].copy()
+        n_dropped = n_before - len(df)
+        if n_dropped > 0:
+            logger.info(f"FHA: dropped {n_dropped} station rows with non-cardinal "
+                        f"travel_dir (diagonal codes 2/4/6/8)")
+        if df.empty:
+            return pd.DataFrame()
+        df['travel_dir'] = df['travel_dir'].astype(int)
+
+        # Deduplicate: keep one row per (station_id, travel_dir) — the STA file
+        # has one row per direction (and per lane); we want a single row per
+        # station-direction carrying the shared location.
+        stations = df.drop_duplicates(subset=['station_id', 'travel_dir'], keep='first')
 
         result = pd.DataFrame({
             'station_id': stations['station_id'],
+            'travel_dir': stations['travel_dir'],
             'lat': stations['lat'],
             'lon': stations['lon'],
             'county_code': stations['county_code'],
@@ -305,21 +374,34 @@ class FHACountsManager:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
 
+        # Keep only cardinal directions (1=N,3=E,5=S,7=W); drop diagonal codes
+        # so they never reach aggregation (matches _parse_stations).
+        n_before = len(df)
+        df = df[df['travel_dir'].isin([1, 3, 5, 7])].copy()
+        n_dropped = n_before - len(df)
+        if n_dropped > 0:
+            logger.info(f"FHA: dropped {n_dropped} volume rows with non-cardinal "
+                        f"travel_dir (diagonal codes 2/4/6/8)")
+
         df['state_code'] = state_fips
 
         return df
 
-    def _aggregate_to_bidirectional(self, volumes_df: pd.DataFrame) -> pd.DataFrame:
+    def _aggregate_by_direction(self, volumes_df: pd.DataFrame) -> pd.DataFrame:
         """
-        Aggregate raw volume data to one row per station with 24 bidirectional
-        hourly averages:
+        Aggregate raw volume data to one row per (station, travel_dir) with 24
+        per-direction hourly averages:
           1. Filter to weekdays only (day_of_week 2-6 = Mon-Fri)
           2. Sum across lanes per (station, direction, day, hour)
           3. Average across weekdays per (station, direction, hour)
-          4. Sum opposite direction pairs per station
+
+        Opposite directions are NOT summed — each direction is kept separate so
+        the real directional split is preserved (a 50/50 split is wrong on most
+        commuter corridors).
 
         Returns:
-            DataFrame with columns: station_id, state_code, h01..h24, num_weekdays_averaged
+            DataFrame with columns: station_id, state_code, travel_dir,
+            h01..h24, num_weekdays_averaged
         """
         hour_cols = [f'hour_{i:02d}' for i in range(24)]
 
@@ -340,35 +422,33 @@ class FHACountsManager:
             ['station_id', 'state_code', 'travel_dir'], as_index=False
         )[hour_cols].mean()
 
-        # Count weekdays per station for metadata
-        weekday_counts = lane_summed.groupby('station_id')[day_col].nunique().reset_index()
-        weekday_counts.columns = ['station_id', 'num_weekdays_averaged']
+        # Count weekdays per (station, direction) for metadata
+        weekday_counts = lane_summed.groupby(
+            ['station_id', 'travel_dir'], as_index=False
+        )[day_col].nunique()
+        weekday_counts.columns = ['station_id', 'travel_dir', 'num_weekdays_averaged']
 
-        # Step 4: Sum opposite direction pairs per station
-        # Group by station and sum all directions (bidirectional total)
-        bidir = dir_avg.groupby(
-            ['station_id', 'state_code'], as_index=False
-        )[hour_cols].sum()
-
-        # Rename hour_00..hour_23 -> h01..h24
+        # Rename hour_00..hour_23 -> h01..h24 (no opposite-direction sum)
         rename_map = {f'hour_{i:02d}': f'h{i+1:02d}' for i in range(24)}
-        bidir = bidir.rename(columns=rename_map)
+        bidir = dir_avg.rename(columns=rename_map)
 
-        # Merge weekday counts
-        bidir = bidir.merge(weekday_counts, on='station_id', how='left')
+        # Merge weekday counts per (station, direction)
+        bidir = bidir.merge(weekday_counts, on=['station_id', 'travel_dir'], how='left')
 
         return bidir
 
     def _load_to_db(self, stations_df: pd.DataFrame, volumes_df: pd.DataFrame):
         """Load stations and volumes to the database."""
-        # Build station records
+        # Build station records (PK includes travel_dir: one row per direction)
         station_records = []
         for _, row in stations_df.iterrows():
-            pk = f"{row['state_code']}_{row['station_id']}"
+            travel_dir = int(row['travel_dir'])
+            pk = f"{row['state_code']}_{row['station_id']}_{travel_dir}"
             station_records.append({
                 'id': pk,
                 'state_code': str(row['state_code']),
                 'station_id': str(row['station_id']),
+                'travel_dir': travel_dir,
                 'lat': float(row['lat']),
                 'lon': float(row['lon']),
                 'county_code': str(row['county_code']),
@@ -377,16 +457,18 @@ class FHACountsManager:
                 'year': int(row['year']),
             })
 
-        # Build volume records
+        # Build volume records (PK includes travel_dir: one row per direction)
         hour_cols = [f'h{i:02d}' for i in range(1, 25)]
         volume_records = []
         for _, row in volumes_df.iterrows():
-            pk = f"{row['state_code']}_{row['station_id']}"
+            travel_dir = int(row['travel_dir'])
+            pk = f"{row['state_code']}_{row['station_id']}_{travel_dir}"
             rec = {
                 'id': pk,
                 'station_pk': pk,
                 'state_code': str(row['state_code']),
                 'station_id': str(row['station_id']),
+                'travel_dir': travel_dir,
                 'num_weekdays_averaged': int(row.get('num_weekdays_averaged', 0)),
             }
             for hcol in hour_cols:

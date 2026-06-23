@@ -159,6 +159,38 @@ class SimulationEvaluator:
         linkstats_files.sort(key=get_iteration_num)
         return linkstats_files[-1]
 
+    def find_countscompare_file(self) -> Optional[Path]:
+        """
+        Find the MATSim countscompare.txt for the last iteration.
+
+        MATSim's counts module writes *.countscompare.txt (one row per count
+        station per hour) with a scale-corrected, iteration-averaged GEH. This
+        is the canonical comparison; the evaluator reads it directly rather
+        than recomputing volumes from linkstats.
+
+        Returns:
+            Path to countscompare.txt, or None if not found.
+        """
+        output_dir = self.experiment_dir / "output"
+        iters_dir = output_dir / "ITERS"
+        if not iters_dir.exists():
+            return None
+
+        # Plain countscompare only — exclude the *AWTV.txt variant.
+        files = [p for p in iters_dir.glob("it.*/*.countscompare.txt")
+                 if not p.name.endswith("AWTV.txt")]
+        if not files:
+            return None
+
+        def get_iteration_num(path):
+            try:
+                return int(path.parent.name.split('.')[-1])
+            except (ValueError, IndexError):
+                return -1
+
+        files.sort(key=get_iteration_num)
+        return files[-1]
+
     def find_network_file(self) -> Optional[Path]:
         """
         Automatically find the network file in the experiment output directory.
@@ -461,6 +493,13 @@ class SimulationEvaluator:
     def compare_volumes(self, matched_devices: pd.DataFrame,
                        linkstats: pd.DataFrame) -> pd.DataFrame:
         """
+        DEPRECATED — superseded by compare_volumes_from_countscompare().
+
+        Recomputes GEH from linkstats by summing forward+reverse link volumes.
+        run_evaluation() no longer calls this; the canonical comparison reads
+        MATSim's scale-corrected, iteration-averaged countscompare.txt instead.
+        Kept only as a linkstats-based diagnostic reference.
+
         Compare ground truth volumes with simulation volumes.
         Sums volumes from both forward and reverse links when available,
         since traffic counting devices typically measure both directions.
@@ -583,6 +622,89 @@ class SimulationEvaluator:
 
         return pd.DataFrame(results)
 
+    @staticmethod
+    def _station_base(cs_id: str) -> str:
+        """Strip the trailing _<dir> from an FHA per-direction station id.
+
+        'FHA_27_000026_1' -> 'FHA_27_000026'. Custom/legacy ids without a
+        numeric direction suffix are returned unchanged. A combined cs_id
+        ('A+B', from two stations on one link) keeps its first segment's base.
+        """
+        sid = str(cs_id).split('+')[0]
+        parts = sid.rsplit('_', 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            return parts[0]
+        return sid
+
+    def compare_volumes_from_countscompare(self, countscompare_path: Path) -> pd.DataFrame:
+        """Build the comparison table directly from MATSim's countscompare.txt.
+
+        One row per count station per hour. Observed/simulated/GEH come from
+        MATSim (scale-corrected, averaged over the last iterations), so the
+        evaluator reports the same numbers MATSim does — no recomputation and
+        no forward+reverse summing.
+
+        Returns a DataFrame with the same columns the rest of the evaluator
+        consumes: device_id, link_id, reverse_link_id, bidirectional, hour,
+        observed, simulated, error, abs_error, pct_error, geh, plus a
+        station_base column for per-physical-station aggregation.
+        """
+        df = pd.read_csv(countscompare_path, sep='\t')
+        df.columns = [c.strip() for c in df.columns]
+
+        col = {
+            'link': 'Link Id',
+            'station': 'Count Station Id',
+            'hour': 'Hour',
+            'sim': 'MATSIM volumes',
+            'obs': 'Count volumes',
+            'geh': 'GEH',
+        }
+        missing = [c for c in col.values() if c not in df.columns]
+        if missing:
+            raise ValueError(f"countscompare.txt missing columns {missing} "
+                             f"(found {list(df.columns)})")
+
+        results = []
+        zero_observed_count = 0
+        for _, r in df.iterrows():
+            observed = float(r[col['obs']])
+            simulated = float(r[col['sim']])
+            # countscompare Hour is 1..24; the evaluator uses 0..23 internally.
+            hour = int(r[col['hour']]) - 1
+            error = simulated - observed
+            if observed > 0:
+                pct_error = error / observed * 100
+            else:
+                pct_error = np.nan
+                zero_observed_count += 1
+            geh = float(r[col['geh']])
+            device_id = str(r[col['station']])
+            results.append({
+                'device_id': device_id,
+                'station_base': self._station_base(device_id),
+                'link_id': self._normalize_link_id(r[col['link']]),
+                'reverse_link_id': None,
+                'bidirectional': False,
+                'hour': hour,
+                'observed': observed,
+                'simulated': simulated,
+                'error': error,
+                'abs_error': abs(error),
+                'pct_error': pct_error,
+                'geh': geh,
+            })
+
+        if zero_observed_count > 0:
+            logger.info(f"Found {zero_observed_count} hourly observations with zero "
+                        f"observed volume (pct_error set to NaN)")
+
+        comparison_df = pd.DataFrame(results)
+        logger.info(f"Read {len(comparison_df):,} station-hour comparisons from "
+                    f"{countscompare_path.name} "
+                    f"({comparison_df['device_id'].nunique()} stations)")
+        return comparison_df
+
     def calculate_summary_metrics(self, comparison_df: pd.DataFrame) -> Dict:
         """
         Calculate summary statistics for the comparison
@@ -611,9 +733,13 @@ class SimulationEvaluator:
         zero_observed_count = comparison_df['pct_error'].isna().sum()
         valid_pct_error_count = comparison_df['pct_error'].notna().sum()
 
-        # Count bidirectional matches
-        bidirectional_count = comparison_df['bidirectional'].sum() if 'bidirectional' in comparison_df.columns else 0
-        unique_bidirectional_devices = comparison_df[comparison_df['bidirectional'] == True]['device_id'].nunique() if 'bidirectional' in comparison_df.columns else 0
+        # Distinct physical stations (stripping the per-direction suffix) and
+        # distinct per-direction count stations.
+        if 'station_base' in comparison_df.columns:
+            num_physical_stations = comparison_df['station_base'].nunique()
+        else:
+            num_physical_stations = comparison_df['device_id'].nunique()
+        num_directional_counts = comparison_df['device_id'].nunique()
 
         # GEH metrics excluding NaN (zero-zero pairs)
         valid_geh = comparison_df['geh'].dropna()
@@ -650,9 +776,9 @@ class SimulationEvaluator:
             pct_stations_below_10pct = sum(1 for r in station_ratios if r < 0.10) / n * 100
 
         metrics = {
-            'num_devices': comparison_df['device_id'].nunique(),
+            'num_devices': int(num_physical_stations),
             'num_comparisons': len(comparison_df),
-            'num_bidirectional_devices': int(unique_bidirectional_devices),
+            'num_directional_counts': int(num_directional_counts),
             'mean_error': comparison_df['error'].mean(),
             'mae': comparison_df['abs_error'].mean(),
             'rmse': np.sqrt((comparison_df['error']**2).mean()),
@@ -1523,17 +1649,30 @@ class SimulationEvaluator:
         mae = device_data['abs_error'].mean()
         rmse = np.sqrt((device_data['error']**2).mean())
         mean_geh = device_data['geh'].mean()
-        geh_lt_5_pct = (device_data['geh'] < 5).sum() / len(device_data) * 100
-        correlation = device_data[['observed', 'simulated']].corr().iloc[0, 1]
+        # GEH<5 share over hours with a defined GEH (NaN = zero-zero hours, which
+        # are neither a match nor a miss). Counting them in the denominator would
+        # understate the pass rate.
+        valid_geh = device_data['geh'].dropna()
+        geh_lt_5_pct = ((valid_geh < 5).sum() / len(valid_geh) * 100
+                        if len(valid_geh) > 0 else float('nan'))
+        # Correlation is undefined when observed or simulated is constant (e.g. an
+        # all-zero simulated series); guard so the table shows N/A, not "nan".
+        if device_data['observed'].nunique() > 1 and device_data['simulated'].nunique() > 1:
+            correlation = device_data[['observed', 'simulated']].corr().iloc[0, 1]
+        else:
+            correlation = float('nan')
 
-        # Create table
+        # Create table ('N/A' when a metric is undefined for this device)
+        geh_lt_5_str = f'{geh_lt_5_pct:.1f}%' if np.isfinite(geh_lt_5_pct) else 'N/A'
+        mean_geh_str = f'{mean_geh:.2f}' if np.isfinite(mean_geh) else 'N/A'
+        corr_str = f'{correlation:.3f}' if np.isfinite(correlation) else 'N/A'
         stats_data = [
             ['Metric', 'Value'],
             ['Mean Abs Error (MAE)', f'{mae:.1f} veh/hr'],
             ['Root Mean Sq Error (RMSE)', f'{rmse:.1f} veh/hr'],
-            ['Mean GEH', f'{mean_geh:.2f}'],
-            ['Hours with GEH < 5', f'{geh_lt_5_pct:.1f}%'],
-            ['Correlation', f'{correlation:.3f}'],
+            ['Mean GEH', mean_geh_str],
+            ['Hours with GEH < 5', geh_lt_5_str],
+            ['Correlation', corr_str],
         ]
 
         table = ax.table(cellText=stats_data, cellLoc='left', loc='center',
@@ -1603,6 +1742,23 @@ class SimulationEvaluator:
                 'experiment_name': self.experiment_dir.name
             }
 
+        # GEH/observed/simulated come from MATSim's countscompare.txt — require it.
+        countscompare_path = self.find_countscompare_file()
+        if countscompare_path is None:
+            logger.warning("Cannot generate evaluation: MATSim countscompare.txt was "
+                           "not found under output/ITERS/. This file is written by "
+                           "MATSim's counts module (needs counts.xml + the counts "
+                           "module enabled in config.xml). Without it the GEH/volume "
+                           "comparison cannot be produced.")
+            return pd.DataFrame(), {
+                'num_devices': 0,
+                'num_comparisons': 0,
+                'error': 'countscompare.txt not found',
+                'experiment_name': self.experiment_dir.name
+            }
+        logger.info(f"Using MATSim countscompare file: "
+                    f"{countscompare_path.relative_to(self.experiment_dir)}")
+
         # Auto-detect files if not provided
         if network_path is None:
             network_path = self.find_network_file()
@@ -1629,9 +1785,9 @@ class SimulationEvaluator:
         linkstats = self.load_linkstats(linkstats_path)
         logger.info(f"Loaded {len(linkstats):,} links from linkstats")
 
-        logger.info("Comparing volumes...")
-        comparison_df = self.compare_volumes(matched_devices, linkstats)
-        logger.info(f"Generated {len(comparison_df):,} hourly comparisons")
+        logger.info("Comparing volumes from MATSim countscompare.txt...")
+        comparison_df = self.compare_volumes_from_countscompare(countscompare_path)
+        logger.info(f"Generated {len(comparison_df):,} station-hour comparisons")
 
         logger.info("Calculating summary metrics...")
         summary_metrics = self.calculate_summary_metrics(comparison_df)
@@ -1667,8 +1823,11 @@ class SimulationEvaluator:
             json.dump(summary_metrics, f, indent=2)
         logger.info(f"Saved summary metrics to {metrics_path}")
 
-        logger.info("Generating plots...")
-        self.plot_comparison(comparison_df)
+        # Note: the pooled 4-panel volume_comparison.png was removed — it averaged
+        # GEH / pct-error / volumes across all station-hours, which over-weights
+        # high-volume links and hides per-station matching errors. Per-station
+        # device_reports/ and summary_metrics.json (IQM ratio) are the canonical
+        # views now. plot_comparison() is kept for ad-hoc use but no longer called.
 
         # Generate spatial maps if requested and we have matched devices
         if generate_spatial_maps and len(matched_devices) > 0:

@@ -16,6 +16,9 @@ DuckDB / Java stays green.
 - **`smoke/`** — every first-party module imports (auto-discovered via
   `walk_packages`, so new modules are covered with no edits), the real and
   fixture configs validate, coordinate math, and small pure-logic helpers.
+  Includes `test_fha_perdirection.py`: link-bearing math, bearing-based
+  travel_dir→link assignment (antiparallel pairing + missing-antiparallel
+  drop), and the evaluator's countscompare.txt reader.
 - **`e2e/`** — runs the real `ExperimentRunner` on `fixtures/config_smoke.json`
   (one county, tiny scaling, `--skip-simulation`) and asserts `plans.xml` /
   `network.xml` are valid and non-trivial.

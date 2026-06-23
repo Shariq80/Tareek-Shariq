@@ -883,6 +883,8 @@ class ExperimentRunner:
             logger.info("")
             return None
 
+        from data_sources.fha_counts_manager import FHACountsManager, FHASchemaError
+
         try:
             self.counts_path = self.experiment_dir / 'counts.xml'
             rebuild = counts_config.get('rebuild', True)
@@ -910,13 +912,16 @@ class ExperimentRunner:
                 db_manager = initialize_tables(data_dir)
 
                 if fha_weight > 0:
-                    from data_sources.fha_counts_manager import FHACountsManager
                     fha_manager = FHACountsManager(self.config, db_manager)
                     fha_success = fha_manager.setup(rebuild=rebuild)
                     if not fha_success:
                         logger.warning("FHA counts setup failed â€” continuing without FHA data")
                 else:
                     logger.info("FHA counts setup skipped (weight=0)")
+            except FHASchemaError:
+                # Incompatible DB schema is fatal and user-actionable: do NOT
+                # continue without FHA data. Re-raise to stop the run.
+                raise
             except Exception as e:
                 logger.warning(f"FHA counts setup error: {e}")
 
@@ -938,13 +943,18 @@ class ExperimentRunner:
             self.counts_stats = {
                 'num_devices_matched': counts_metadata.get('num_devices_matched', 0),
                 'num_count_locations': counts_metadata.get('num_count_locations', 0),
-                'num_bidirectional': counts_metadata.get('num_bidirectional', 0),
+                'num_fha_stations_matched': counts_metadata.get('num_fha_stations_matched', 0),
+                'num_directional_counts': counts_metadata.get('num_directional_counts', 0),
+                'num_custom_bidirectional': counts_metadata.get('num_custom_bidirectional', 0),
                 'generated': True,
             }
 
             logger.info("")
             return counts_path
 
+        except FHASchemaError:
+            # Fatal, user-actionable: stop the run so the user migrates the DB.
+            raise
         except Exception as e:
             logger.warning(f"Counts generation failed: {e}")
             logger.warning("Continuing without counts validation")

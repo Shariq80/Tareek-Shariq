@@ -114,7 +114,7 @@
       "share_adjustment": 0.0
     },
     "bike": {
-      "enabled": true,
+      "enabled": false,
       "matsim_mode": "bike",
       "availability": {
         "type": "distance",
@@ -142,7 +142,7 @@
   },
   "plan_generation": {
     "target_plans": "all",
-    "scaling_factor": 0.0001,
+    "scaling_factor": 0.01,
     "work_scaling_multiplier": 1.0,
     "random_seed": 42,
     "skip_if_exists": true,
