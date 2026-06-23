@@ -458,21 +458,48 @@ class OSMDownloader:
         # Time the merge
         start_time = time.time()
 
-        # Run osmium merge
-        # Note: Input files should be non-overlapping extracts for best results
-        cmd = [
-            'osmium',
-            'merge',
-            *[str(pbf) for pbf in input_pbf_files],
-            '-o', str(output_pbf),
-            '--overwrite'
-        ]
+        # Multi-state extracts overlap at shared borders, so the same OSM object
+        # (e.g. a border node) appears in more than one input. `osmium merge`
+        # only collapses duplicates that are byte-identical; when the state caches
+        # are different vintages the same id carries DIFFERENT version metadata,
+        # so merge emits it twice and pt2matsim then fails with
+        # "Node id <X> already exists on map".
+        #
+        # Fix: strip version/timestamp/changeset/uid/user from each input first.
+        # pt2matsim only needs geometry + tags, so dropping this metadata makes
+        # duplicate objects byte-identical and lets merge collapse them — robust
+        # to any mix of cache vintages, for any multi-state region.
+        clean_attrs = ['version', 'timestamp', 'changeset', 'uid', 'user']
+        cleaned_files: List[Path] = []
+        try:
+            for i, pbf in enumerate(input_pbf_files):
+                cleaned = output_pbf.parent / f"_merge_clean_{int(start_time)}_{i}.osm.pbf"
+                clean_cmd = ['osmium', 'cat', str(pbf)]
+                for attr in clean_attrs:
+                    clean_cmd += ['-c', attr]
+                clean_cmd += ['-o', str(cleaned), '--overwrite']
+                res = subprocess.run(clean_cmd, capture_output=True, text=True)
+                if res.returncode != 0:
+                    logger.error(f"Osmium clean failed for {pbf.name}: {res.stderr}")
+                    raise RuntimeError(f"Osmium clean failed: {res.stderr}")
+                cleaned_files.append(cleaned)
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
-
-        if result.returncode != 0:
-            logger.error(f"Osmium merge failed: {result.stderr}")
-            raise RuntimeError(f"Osmium merge failed: {result.stderr}")
+            # Run osmium merge on the metadata-stripped (now-dedupable) inputs.
+            cmd = [
+                'osmium',
+                'merge',
+                *[str(pbf) for pbf in cleaned_files],
+                '-o', str(output_pbf),
+                '--overwrite'
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                logger.error(f"Osmium merge failed: {result.stderr}")
+                raise RuntimeError(f"Osmium merge failed: {result.stderr}")
+        finally:
+            for cf in cleaned_files:
+                if cf.exists():
+                    cf.unlink()
 
         merge_time = time.time() - start_time
         output_size_mb = output_pbf.stat().st_size / 1024 / 1024
