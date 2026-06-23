@@ -36,8 +36,39 @@ class NetworkGenerator:
         # subprocesses. Without an explicit -Xmx the JVM defaults to 1/4 of
         # physical RAM, which OOMs on large OSM extracts. This is distinct
         # from matsim.heap_size_gb, which sizes the simulation run (runner.py).
-        self.network_heap_size_gb = self.matsim_config.get('network_heap_size_gb', 4)
+        #
+        # Default 8g comfortably fits a 16 GB commodity PC and covers small-to-
+        # medium regions; large multi-county/multi-state networks (e.g. a full
+        # metro across two states) should raise it in the region config. The
+        # value is clamped to physical RAM so an over-large request can never
+        # make the JVM fail to launch on a small machine.
+        requested_gb = self.matsim_config.get('network_heap_size_gb', 8)
+        self.network_heap_size_gb = self._clamp_heap_to_ram(requested_gb)
         self.downloader = OSMDownloader()
+
+    @staticmethod
+    def _clamp_heap_to_ram(requested_gb: int) -> int:
+        """Cap the requested -Xmx (GB) at ~70% of physical RAM.
+
+        -Xmx is a reservation ceiling; requesting more than the machine has
+        makes the JVM fail to start ("Could not reserve enough space for object
+        heap"). Clamping keeps a high config value safe on a small machine while
+        leaving headroom for the OS, Python, and OSM file buffers. Never goes
+        below 2g. Falls back to the requested value if RAM can't be determined.
+        """
+        try:
+            import psutil
+            total_gb = psutil.virtual_memory().total / (1024 ** 3)
+            safe_cap = max(2, int(total_gb * 0.70))
+            if requested_gb > safe_cap:
+                logger.warning(
+                    f"network_heap_size_gb={requested_gb}g exceeds 70% of "
+                    f"physical RAM ({total_gb:.1f}g); clamping to {safe_cap}g."
+                )
+                return safe_cap
+        except Exception as e:
+            logger.debug(f"Could not determine RAM for heap clamp: {e}")
+        return requested_gb
 
     def _get_enabled_transit_modes(self) -> list:
         """Return list of enabled mode names that map to MATSim 'pt' (transit modes)."""
