@@ -32,6 +32,13 @@ HOUR_COLS = [f'h{i:02d}' for i in range(1, 25)]
 # Uppercase versions for matched_devices.csv (evaluator compatibility)
 HOUR_COLS_UPPER = [f'H{i:02d}' for i in range(1, 25)]
 
+# FHWA cardinal direction codes -> compass bearing in degrees (clockwise from North).
+# 1=N, 3=E, 5=S, 7=W. Bearings are compared against UTM grid-north link bearings;
+# grid-vs-true north convergence is < ~2 deg within a single county, so this is safe.
+DIR_TO_BEARING = {1: 0.0, 3: 90.0, 5: 180.0, 7: 270.0}
+# Opposite direction pairs (used to assign the two carriageways of a sensor jointly).
+OPPOSITE_DIRS = {1: 5, 5: 1, 3: 7, 7: 3}
+
 
 class CountsGenerator:
     """Generate MATSim counts.xml from FHA and/or custom traffic count data."""
@@ -62,6 +69,7 @@ class CountsGenerator:
         self.network_links = None
         self.spatial_index = None
         self.link_geometries = None
+        self._link_endpoints = {}  # link_id -> (from_x, from_y, to_x, to_y)
         self._reverse_node_index = None  # {(to_node, from_node): link_id}
 
         # Coordinate transformer (WGS84 to UTM)
@@ -88,10 +96,12 @@ class CountsGenerator:
         records = []
         for s in stations:
             records.append({
-                'LOCAL_ID': f"FHA_{s.state_code}_{s.station_id}",
+                'LOCAL_ID': f"FHA_{s.state_code}_{s.station_id}_{s.travel_dir}",
+                'station_base': f"FHA_{s.state_code}_{s.station_id}",
+                'travel_dir': int(s.travel_dir),
                 'Latitude': s.lat,
                 'Longitude': s.lon,
-                'Directions': 'Bidirectional',
+                'Directions': str(s.travel_dir),
                 'source': 'fha',
             })
         return pd.DataFrame(records)
@@ -112,7 +122,7 @@ class CountsGenerator:
 
         records = []
         for v in volumes:
-            rec = {'LOCAL_ID': f"FHA_{v.state_code}_{v.station_id}"}
+            rec = {'LOCAL_ID': f"FHA_{v.state_code}_{v.station_id}_{v.travel_dir}"}
             for hcol, hcol_upper in zip(HOUR_COLS, HOUR_COLS_UPPER):
                 rec[hcol_upper] = getattr(v, hcol, 0.0) or 0.0
             records.append(rec)
@@ -288,6 +298,11 @@ class CountsGenerator:
         self.network_links = links_df
         self.spatial_index = spatial_idx
         self.link_geometries = link_geometries
+        # link_id -> {from_x, from_y, to_x, to_y} for O(1) bearing lookups.
+        self._link_endpoints = {
+            r['link_id']: (r['from_x'], r['from_y'], r['to_x'], r['to_y'])
+            for _, r in links_df.iterrows()
+        }
 
         # Build reverse-node index: (to_node, from_node) → link_id
         # For a link A→B, the reverse link is B→A.
@@ -330,6 +345,91 @@ class CountsGenerator:
                 nearest_link_id = link_id
 
         return nearest_link_id, min_distance
+
+    @staticmethod
+    def _link_bearing(from_x: float, from_y: float,
+                      to_x: float, to_y: float) -> Optional[float]:
+        """Bearing of a link in degrees clockwise from grid-north (0=N, 90=E).
+
+        Returns None for a zero-length link.
+        """
+        dx = to_x - from_x
+        dy = to_y - from_y
+        if dx * dx + dy * dy < 1e-12:
+            return None
+        # atan2(east, north) gives clockwise-from-north; normalize to [0, 360).
+        bearing = np.degrees(np.arctan2(dx, dy)) % 360.0
+        return bearing
+
+    @staticmethod
+    def _angular_diff(a: float, b: float) -> float:
+        """Smallest absolute difference between two bearings, in [0, 180]."""
+        d = abs(a - b) % 360.0
+        return d if d <= 180.0 else 360.0 - d
+
+    def _nearby_link_ids(self, x: float, y: float,
+                         buffer_m: float = 1000) -> List[str]:
+        """Candidate link IDs within buffer_m of a point (UTM)."""
+        if self.spatial_index is None or self.network_links is None:
+            raise ValueError("Network not loaded. Call load_network() first.")
+        nearby_indices = list(self.spatial_index.intersection(
+            (x - buffer_m, y - buffer_m, x + buffer_m, y + buffer_m)
+        ))
+        return [self.network_links.iloc[idx]['link_id'] for idx in nearby_indices]
+
+    def match_direction_to_link(self, x: float, y: float, travel_dir: int,
+                                exclude_link_id: Optional[str] = None,
+                                angle_tol_deg: float = 45.0,
+                                buffer_m: float = 1000) -> Tuple[Optional[str], float, str]:
+        """Assign one FHA travel direction to the best network link by bearing.
+
+        Among links near (x, y), pick the one whose grid-north bearing is
+        closest to the compass heading for *travel_dir*, breaking near-ties by
+        distance to the sensor. If no link is within *angle_tol_deg*, fall back
+        to the nearest link regardless of bearing.
+
+        Args:
+            travel_dir: FHWA cardinal code (1=N, 3=E, 5=S, 7=W).
+            exclude_link_id: a link already taken by the opposite direction.
+
+        Returns:
+            (link_id, distance_m, method) where method is one of
+            'bearing' | 'fallback_nearest' | 'none'.
+        """
+        target_bearing = DIR_TO_BEARING.get(int(travel_dir))
+        if target_bearing is None:
+            return None, float('inf'), 'none'
+
+        point = Point(x, y)
+        link_ids = self._nearby_link_ids(x, y, buffer_m=buffer_m)
+        if not link_ids:
+            return None, float('inf'), 'none'
+
+        # Score links within the angular tolerance: prefer the smallest bearing
+        # difference; among comparable bearings, prefer the closest link.
+        best_within = None  # (angle_diff, distance, link_id)
+        nearest_any = None   # (distance, link_id) — for the fallback
+        for lid in link_ids:
+            if exclude_link_id is not None and lid == exclude_link_id:
+                continue
+            fx, fy, tx, ty = self._link_endpoints[lid]
+            dist = point.distance(self.link_geometries[lid])
+            if nearest_any is None or dist < nearest_any[0]:
+                nearest_any = (dist, lid)
+            bearing = self._link_bearing(fx, fy, tx, ty)
+            if bearing is None:
+                continue
+            adiff = self._angular_diff(bearing, target_bearing)
+            if adiff <= angle_tol_deg:
+                cand = (adiff, dist, lid)
+                if best_within is None or cand < best_within:
+                    best_within = cand
+
+        if best_within is not None:
+            return best_within[2], best_within[1], 'bearing'
+        if nearest_any is not None:
+            return nearest_any[1], nearest_any[0], 'fallback_nearest'
+        return None, float('inf'), 'none'
 
     def get_reverse_link_id(self, link_id: str) -> Optional[str]:
         """
@@ -489,6 +589,103 @@ class CountsGenerator:
 
         df = df[df['matched_link_id'].notna()]
         return df
+
+    def match_fha_directional_to_links(self, ground_truth: pd.DataFrame,
+                                       device_locations: pd.DataFrame) -> pd.DataFrame:
+        """Match FHA per-direction devices to links — proximity first, then bearing.
+
+        A physical sensor sits ON one road, so the two travel directions are the
+        two antiparallel carriageways of the NEAREST link, not just any link with
+        a matching bearing. For each station:
+          1. find the nearest link (carriageway A) and its reverse (carriageway B);
+          2. assign each FHA travel_dir to whichever of {A, B} has the closest
+             bearing to that direction's compass heading;
+          3. if only one carriageway exists (no antiparallel), keep the
+             higher-volume direction on it and drop + log the other.
+
+        Bearing is used only to decide which carriageway is which direction — it
+        never overrides proximity, so a far-away but perfectly-aligned link can't
+        win over the road the sensor is actually on.
+
+        Returns a DataFrame with one row per assigned direction, columns:
+        LOCAL_ID, station_base, travel_dir, H01..H24, Latitude, Longitude,
+        utm_x, utm_y, matched_link_id, distance_m, reverse_link_id.
+        """
+        df = ground_truth.merge(device_locations, on='LOCAL_ID', how='inner')
+        if df.empty:
+            return df
+
+        if 'utm_x' not in df.columns:
+            utm_coords = df.apply(
+                lambda row: self.convert_latlon_to_utm(row['Latitude'], row['Longitude']),
+                axis=1
+            )
+            df['utm_x'] = utm_coords.apply(lambda c: c[0])
+            df['utm_y'] = utm_coords.apply(lambda c: c[1])
+
+        results = []
+        n_assigned = n_dropped = 0
+
+        for station_base, grp in df.groupby('station_base'):
+            rows = list(grp.iterrows())
+            # Heavier direction first, so it wins the single carriageway if the
+            # antiparallel is missing.
+            def _row_total(r):
+                return float(sum(r[h] for h in HOUR_COLS_UPPER if h in r.index))
+            rows.sort(key=lambda ir: _row_total(ir[1]), reverse=True)
+
+            x = rows[0][1]['utm_x']
+            y = rows[0][1]['utm_y']
+
+            # Carriageways = nearest link + its antiparallel reverse.
+            nearest_id, nearest_dist = self.find_nearest_link(x, y)
+            if nearest_id is None:
+                for _, row in rows:
+                    n_dropped += 1
+                    logger.info(f"FHA: station {station_base} dir "
+                                f"{int(row['travel_dir'])}: no nearby link — dropped")
+                continue
+            reverse_id = self.get_reverse_link_id(nearest_id)
+
+            # Candidate links with their bearings.
+            candidates = [nearest_id]
+            if reverse_id and reverse_id != nearest_id:
+                candidates.append(reverse_id)
+
+            def _bearing_of(lid):
+                fx, fy, tx, ty = self._link_endpoints[lid]
+                return self._link_bearing(fx, fy, tx, ty)
+
+            taken = set()
+            for _, row in rows:
+                travel_dir = int(row['travel_dir'])
+                target = DIR_TO_BEARING.get(travel_dir)
+                avail = [c for c in candidates if c not in taken]
+                if not avail or target is None:
+                    n_dropped += 1
+                    logger.info(f"FHA: station {station_base} dir {travel_dir}: "
+                                f"no distinct carriageway available — dropped")
+                    continue
+                # Pick the available carriageway whose bearing best matches.
+                best = min(
+                    avail,
+                    key=lambda lid: (self._angular_diff(_bearing_of(lid), target)
+                                     if _bearing_of(lid) is not None else 999.0)
+                )
+                rec = row.to_dict()
+                rec['matched_link_id'] = best
+                rec['distance_m'] = nearest_dist
+                rec['reverse_link_id'] = self.get_reverse_link_id(best)
+                results.append(rec)
+                taken.add(best)
+                n_assigned += 1
+
+        logger.info(f"FHA directional matching: {n_assigned} assigned, "
+                    f"{n_dropped} dropped (no distinct carriageway)")
+
+        if not results:
+            return pd.DataFrame()
+        return pd.DataFrame(results)
 
     # ── Blending ─────────────────────────────────────────────────────────────
 
@@ -658,8 +855,8 @@ class CountsGenerator:
                 logger.info(f"FHA: {len(filtered_fha)} stations within network area "
                             f"(of {len(fha_stations)} total)")
                 if not filtered_fha.empty:
-                    fha_matched = self.match_devices_to_links(fha_volumes, filtered_fha)
-                    logger.info(f"FHA: matched {len(fha_matched)} stations to network links")
+                    fha_matched = self.match_fha_directional_to_links(fha_volumes, filtered_fha)
+                    logger.info(f"FHA: matched {len(fha_matched)} station-directions to network links")
             else:
                 logger.warning("FHA: no station/volume data available")
         else:
@@ -712,18 +909,33 @@ class CountsGenerator:
 
         # Accumulate volumes per link, averaging when multiple stations match
         link_entries: Dict[str, dict] = {}
-        bidirectional_count = 0
+        directional_count = 0
+        custom_bidirectional_count = 0
 
         for _, device in matched.iterrows():
             device_id = str(device['LOCAL_ID'])
             link_id = device['matched_link_id']
-            reverse_link_id = device.get('reverse_link_id')
 
+            # FHA rows are already per-direction (they carry travel_dir): emit
+            # the real measured volume on the single matched link, no split.
+            is_directional = ('travel_dir' in device.index
+                              and pd.notna(device.get('travel_dir')))
+
+            if is_directional:
+                directional_count += 1
+                vols = [int(round(device[h])) for h in HOUR_COLS_UPPER]
+                self._accumulate_link_entry(link_entries, str(link_id),
+                                            device_id, vols)
+                continue
+
+            # Custom rows have no direction info: keep the legacy 50/50 split
+            # across the matched link and its geometric reverse.
+            reverse_link_id = device.get('reverse_link_id')
             is_bidirectional = (reverse_link_id is not None
                                 and pd.notna(reverse_link_id))
 
             if is_bidirectional:
-                bidirectional_count += 1
+                custom_bidirectional_count += 1
                 fwd_vols = [int(round(device[h] / 2)) for h in HOUR_COLS_UPPER]
                 rev_vols = list(fwd_vols)
                 self._accumulate_link_entry(link_entries, str(link_id),
@@ -772,7 +984,8 @@ class CountsGenerator:
             f.write(pretty_xml)
 
         logger.info(f"Generated counts.xml with {counts_added} count locations")
-        logger.info(f"  - Bidirectional sensors: {bidirectional_count}")
+        logger.info(f"  - FHA per-direction counts: {directional_count}")
+        logger.info(f"  - Custom bidirectional sensors (50/50 split): {custom_bidirectional_count}")
         logger.info(f"  - Saved to: {output_path}")
 
         # Save matched devices CSV for evaluator
@@ -780,11 +993,16 @@ class CountsGenerator:
         matched.to_csv(matched_devices_path, index=False)
         logger.info(f"  - Saved matched devices to: {matched_devices_path}")
 
+        # Distinct physical stations among matched FHA directions (strip travel_dir).
+        num_fha_stations = (matched['station_base'].nunique()
+                            if 'station_base' in matched.columns else 0)
+
         metadata = {
-            'num_devices_total': len(fha_stations) + (len(custom_matched) if not custom_matched.empty else 0),
             'num_devices_matched': len(matched),
+            'num_fha_stations_matched': int(num_fha_stations),
             'num_count_locations': counts_added,
-            'num_bidirectional': bidirectional_count,
+            'num_directional_counts': directional_count,
+            'num_custom_bidirectional': custom_bidirectional_count,
             'year': self.year,
             'matched_devices_path': str(matched_devices_path),
         }

@@ -1,0 +1,21 @@
+[tool.pytest.ini_options]
+# Test discovery is rooted at tests/ only — never recurse into .venv or data.
+testpaths = ["tests"]
+
+# Plain `pytest` runs ONLY the fast smoke tier, so a checkout without the
+# DuckDB / Java still goes green. Opt into the heavy tiers explicitly:
+#   pytest -m smoke         (default; seconds, no external deps)
+#   pytest -m e2e           (minutes; needs data/db/trafficsim1.2.duckdb)
+#   pytest -m e2e_matsim    (many minutes; needs DuckDB + Java + the jar)
+#   pytest -m ""            (everything — will FAIL loudly if deps missing)
+addopts = "-m smoke -ra"
+
+markers = [
+    "smoke: fast import + pure-logic + config-validation checks; no external deps",
+    "e2e: one-county pipeline through plans + counts (skip_simulation); needs DuckDB",
+    "e2e_matsim: full pipeline incl. 1 MATSim iteration; needs DuckDB + Java + jar",
+]
+
+# Safety net so a hung DB/JVM call can't wedge the suite forever.
+# pytest-timeout is already pinned in requirements.txt.
+timeout = 1800

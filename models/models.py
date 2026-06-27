@@ -196,12 +196,18 @@ class GTFSStopRoute(Base):
 # ── FHA Traffic Counts Tables ─────────────────────────────────────────────────
 
 class FHAStation(Base):
-    """FHA/TMAS traffic monitoring station."""
+    """FHA/TMAS traffic monitoring station, one row per travel direction.
+
+    A physical sensor measures each direction of travel separately, so a
+    station appears once per direction (e.g. dir 1=N and dir 5=S share the
+    same lat/lon). The primary key therefore includes travel_dir.
+    """
     __tablename__ = 'fha_stations'
 
-    id = Column(String, primary_key=True)            # "{state_code}_{station_id}" e.g. "27_000026"
+    id = Column(String, primary_key=True)            # "{state_code}_{station_id}_{travel_dir}" e.g. "27_000026_1"
     state_code = Column(String, nullable=False, index=True)   # 2-digit FIPS state code
     station_id = Column(String, nullable=False)       # Station ID within state
+    travel_dir = Column(Integer, nullable=False)      # FHWA direction code (1=N,3=E,5=S,7=W)
     lat = Column(Float, nullable=False)               # Decimal latitude
     lon = Column(Float, nullable=False)               # Decimal longitude (negative for US)
     county_code = Column(String, nullable=False, index=True)  # 3-digit FIPS county code
@@ -211,13 +217,18 @@ class FHAStation(Base):
 
 
 class FHAHourlyVolume(Base):
-    """FHA/TMAS aggregated bidirectional hourly volumes (one row per station)."""
+    """FHA/TMAS aggregated per-direction hourly volumes (one row per station-direction).
+
+    Volumes are summed across lanes and averaged across weekdays for a single
+    travel direction; opposite directions are NOT summed together.
+    """
     __tablename__ = 'fha_hourly_volumes'
 
-    id = Column(String, primary_key=True)             # "{state_code}_{station_id}"
+    id = Column(String, primary_key=True)             # "{state_code}_{station_id}_{travel_dir}"
     station_pk = Column(String, nullable=False, index=True)   # FK to fha_stations.id
     state_code = Column(String, nullable=False)       # 2-digit FIPS state code
     station_id = Column(String, nullable=False)       # Station ID within state
+    travel_dir = Column(Integer, nullable=False)      # FHWA direction code (1=N,3=E,5=S,7=W)
     h01 = Column(Float, nullable=True)
     h02 = Column(Float, nullable=True)
     h03 = Column(Float, nullable=True)

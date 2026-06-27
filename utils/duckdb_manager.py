@@ -272,6 +272,18 @@ class DBManager:
 
         return processed_record
 
+    def get_table_columns(self, table_name: str) -> List[str]:
+        """Return the column names of an existing table, or [] if it doesn't exist."""
+        try:
+            with self.write_engine_scope() as engine:
+                insp = inspect(engine)
+                if table_name not in insp.get_table_names():
+                    return []
+                return [c['name'] for c in insp.get_columns(table_name)]
+        except SQLAlchemyError as e:
+            logger.error(f"Error inspecting table {table_name}: {str(e)}")
+            return []
+
     def drop_table(self, model_class: Type[ModelType]):
         """
         Drop a specific table from the database

@@ -1,0 +1,202 @@
+{
+  "_comment": "Minimal config for the e2e / e2e_matsim test tiers. One county, tiny scaling, transit OFF (no GTFS download), counts+evaluation OFF, one nonwork purpose, 1 MATSim iteration. Kept deliberately small so the pipeline runs in minutes, not hours. NOT for real experiments.",
+  "region": {
+    "counties": [
+      "27003"
+    ]
+  },
+  "data": {
+    "_data_dir_note": "Resolved relative to THIS file (tests/fixtures/), so ../../data points at the repo data dir.",
+    "data_dir": "../../data",
+    "lodes": {
+      "year": 2023,
+      "job_type": "JT00",
+      "segment": "S000"
+    },
+    "surveys": [
+      {
+        "type": "nhts",
+        "year": "2022",
+        "file": "nhts/csv/tripv2pub.csv",
+        "weight": 1
+      }
+    ]
+  },
+  "modes": {
+    "car": {
+      "enabled": true,
+      "matsim_mode": "car",
+      "availability": "universal",
+      "survey_rate": "auto",
+      "config_rate": null,
+      "blend_weight": 0,
+      "share_adjustment": 0.0
+    },
+    "walk": {
+      "enabled": true,
+      "matsim_mode": "walk",
+      "availability": {
+        "type": "distance",
+        "max_distance_meters": 2000
+      },
+      "survey_rate": "auto",
+      "config_rate": null,
+      "blend_weight": 0.0,
+      "share_adjustment": 0.0
+    },
+    "bike": {
+      "enabled": true,
+      "matsim_mode": "bike",
+      "availability": {
+        "type": "distance",
+        "max_distance_meters": 8000
+      },
+      "survey_rate": "auto",
+      "config_rate": null,
+      "blend_weight": 0.0,
+      "share_adjustment": 0.0
+    }
+  },
+  "mode_choice": {
+    "method": "survey_rates",
+    "fallback_mode": "car",
+    "chain_consistency": true,
+    "min_samples_per_purpose": 30,
+    "max_chain_mode_retries": 10
+  },
+  "plan_generation": {
+    "target_plans": "all",
+    "scaling_factor": 0.001,
+    "work_scaling_multiplier": 1.0,
+    "random_seed": 42,
+    "skip_if_exists": false,
+    "supported_chain_types": [
+      "home_work_home"
+    ],
+    "chain_sampling_method": "generated",
+    "max_chain_retries": 10,
+    "num_processes": 2,
+    "default_mode": "car"
+  },
+  "od_matrix": {
+    "alpha": 0,
+    "beta": 1.5,
+    "max_iterations": 200,
+    "convergence_threshold": 0.03
+  },
+  "time_models": {
+    "kde_bandwidth": "scott",
+    "max_time_retries": 10,
+    "max_duration_sample_attempts": 100
+  },
+  "duration_constraints": {
+    "activity_durations": {
+      "Work": {
+        "min_minutes": 10,
+        "max_minutes": 600,
+        "trim_priority": 1,
+        "target_mean_minutes": 480,
+        "target_std_minutes": 60,
+        "blend_weight": 0
+      },
+      "Shopping": {
+        "min_minutes": 5,
+        "max_minutes": 300,
+        "trim_priority": 3,
+        "target_mean_minutes": 45,
+        "target_std_minutes": 20,
+        "blend_weight": 0
+      }
+    },
+    "trip_durations": {
+      "default": {
+        "min_minutes": 1,
+        "max_minutes": 180
+      }
+    },
+    "max_travel_buffer_minutes": 180,
+    "min_evening_home_minutes": 0,
+    "trim_jitter_minutes": 15,
+    "departure_jitter_minutes": 5
+  },
+  "poi_assignment": {
+    "initial_radius_m": 2000,
+    "radius_increment_m": 1000,
+    "max_poi_retries": 10
+  },
+  "coordinates": {
+    "precision_decimal_places": 2,
+    "utm_epsg": "EPSG:26915"
+  },
+  "chains": {
+    "home_boost_factor": 1.0,
+    "use_weighted_chains": true,
+    "max_length": null,
+    "min_length": 3,
+    "max_work_activities": 2,
+    "early_stop_exponent": 2.0
+  },
+  "logging": {
+    "level": "WARNING",
+    "show_progress_bar": false,
+    "log_to_file": false,
+    "log_to_console": false,
+    "verbose": false
+  },
+  "network": {
+    "clean_network": true,
+    "rebuild_network": false
+  },
+  "matsim": {
+    "version": "matsim_25",
+    "mode": "basic",
+    "run_simulation": true,
+    "heap_size_gb": 4,
+    "transit_network": false,
+    "configurable_params": {
+      "coordinateSystem": "auto",
+      "lastIteration": 1,
+      "outputDirectory": "output",
+      "global.numberOfThreads": 2,
+      "qsim.numberOfThreads": 2,
+      "qsim.flowCapacityFactor": 0.1,
+      "qsim.storageCapacityFactor": 0.12,
+      "linkStats.averageLinkStatsOverIterations": 1
+    }
+  },
+  "counts": {
+    "enabled": false,
+    "rebuild": false
+  },
+  "evaluation": {
+    "run_evaluation": false
+  },
+  "nonwork_purposes": {
+    "nonwork_trip_share": 0.1,
+    "Shopping": {
+      "enabled": true,
+      "trip_generation": {
+        "survey_rate": "auto",
+        "config_rate": 0.2,
+        "blend_weight": 0.5
+      },
+      "od_matrix": {
+        "beta": 2.0,
+        "alpha": 0.1
+      },
+      "poi_weighting": {
+        "enabled": true,
+        "has_name": 1.5,
+        "brand_names": {
+          "Target": 3.0,
+          "Walmart": 3.0,
+          "default": 1.0
+        },
+        "shop_type": {
+          "supermarket": 2.5,
+          "default": 1.0
+        }
+      }
+    }
+  }
+}
