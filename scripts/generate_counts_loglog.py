@@ -20,9 +20,18 @@ Station aggregation:
 
 Edit the EXPERIMENTS dict below to choose which runs to plot.
 
+Comparing across experiments:
+  In overlay mode, pass ``--connect`` to join the same station's points across
+  experiments with a line so you can tell whether a station moved toward the
+  1:1 line (green = improved) or away from it (red = regressed). Without this,
+  overlaid circles and squares can't be matched by eye to the same station.
+  Stations are matched on their full Count Station Id (the station_base when
+  ``--sum-directions`` collapses directions).
+
 Usage:
     python scripts/generate_counts_loglog.py
     python scripts/generate_counts_loglog.py --mode overlay --hours 7 8 16 17
+    python scripts/generate_counts_loglog.py --mode overlay --connect
     python scripts/generate_counts_loglog.py --mode separate --sum-directions
 """
 
@@ -131,6 +140,21 @@ def load_hour(counts_file: Path, hour: int, sum_directions: bool) -> pd.DataFram
     return out
 
 
+def _plot_coords(plot_df: pd.DataFrame) -> pd.DataFrame:
+    """Return per-station plotting coordinates on the log-log axes.
+
+    Zero-observed points are clipped to obs=1 and sim>=1 so they stay on the
+    log axes — the same transform used for the scatter, so connector lines line
+    up exactly with the drawn markers. Columns: station, px (obs), py (sim).
+    """
+    obs = plot_df["obs"].values.astype(float)
+    sim = plot_df["sim"].values.astype(float)
+    px = np.where(obs == 0, 1.0, obs)
+    py = np.where(obs == 0, np.clip(sim, 1, None), sim)
+    return pd.DataFrame({"station": plot_df["station"].astype(str).values,
+                         "px": px, "py": py})
+
+
 def _scatter(ax, plot_df: pd.DataFrame, color: str, marker: str, label: str):
     """Plot one experiment's (obs, sim) points on log-log axes.
 
@@ -153,12 +177,75 @@ def _scatter(ax, plot_df: pd.DataFrame, color: str, marker: str, label: str):
                    zorder=3)
 
 
+def _draw_connectors(ax, coords_by_exp: list[pd.DataFrame]):
+    """Join each station's points across experiments with a thin line.
+
+    coords_by_exp is a list of per-experiment DataFrames (station, px, py) in
+    experiment order. A station present in >=2 experiments gets a polyline
+    through its points, colored by whether the LAST experiment is closer to the
+    1:1 line than the FIRST: green = improved, red = regressed, gray = flat/
+    only-some-present. Distance to 1:1 is |log10(sim) - log10(obs)| (constant
+    on a log-log plot), so it is scale-independent.
+
+    Returns the number of stations connected (drawn with >=2 points).
+    """
+    # station -> ordered list of (exp_index, px, py)
+    per_station: dict[str, list[tuple[int, float, float]]] = {}
+    for ei, coords in enumerate(coords_by_exp):
+        for _, r in coords.iterrows():
+            per_station.setdefault(r["station"], []).append((ei, r["px"], r["py"]))
+
+    def dist_to_diagonal(px: float, py: float) -> float:
+        # |log10(sim) - log10(obs)|; px is plotted-obs, py is plotted-sim.
+        return abs(np.log10(max(py, 1e-9)) - np.log10(max(px, 1e-9)))
+
+    connected = 0
+    labeled = {"improved": False, "regressed": False, "flat": False}
+    color_for = {"improved": "#2ca02c", "regressed": "#d62728", "flat": "#999999"}
+    for pts in per_station.values():
+        if len(pts) < 2:
+            continue  # station not in >=2 experiments — nothing to connect
+        pts.sort(key=lambda t: t[0])  # by experiment order
+        xs = [p[1] for p in pts]
+        ys = [p[2] for p in pts]
+
+        d_first = dist_to_diagonal(pts[0][1], pts[0][2])
+        d_last = dist_to_diagonal(pts[-1][1], pts[-1][2])
+        if d_last < d_first - 1e-9:
+            kind = "improved"
+        elif d_last > d_first + 1e-9:
+            kind = "regressed"
+        else:
+            kind = "flat"
+
+        label = None
+        if not labeled[kind]:
+            label = {"improved": "Improved (toward 1:1)",
+                     "regressed": "Regressed (away from 1:1)",
+                     "flat": "Unchanged"}[kind]
+            labeled[kind] = True
+
+        ax.plot(xs, ys, color=color_for[kind], linewidth=0.8, alpha=0.55,
+                zorder=1, label=label)
+        connected += 1
+
+    return connected
+
+
 def _finalize_axes(ax, all_obs: np.ndarray, all_sim: np.ndarray, title: str):
-    """Add 1:1 / 2x / 0.5x reference lines, log scales, labels, and title."""
+    """Add 1:1 / 2x / 0.5x reference lines, log scales, labels, and title.
+
+    Axis limits auto-fit the data: the log-log range is derived from the actual
+    min/max of all observed+simulated volumes (with a small margin) so points
+    are always visible, whatever the volume scale of the run.
+    """
     vals = np.concatenate([all_obs, all_sim, [1.0]])
     vals = vals[vals > 0]
-    lo = max(vals.min() * 0.5, 1.0)
-    hi = vals.max() * 2.0
+    data_lo = vals.min()
+    data_hi = vals.max()
+    # Reference lines span a little beyond the data on both ends.
+    lo = max(data_lo * 0.5, 1.0)
+    hi = data_hi * 2.0
     x_ref = np.array([lo, hi])
     ax.plot(x_ref, x_ref,       color="#444444", linewidth=1.4, linestyle="-",
             zorder=2, label="1:1 line")
@@ -167,8 +254,9 @@ def _finalize_axes(ax, all_obs: np.ndarray, all_sim: np.ndarray, title: str):
 
     ax.set_xscale("log")
     ax.set_yscale("log")
-    ax.set_xlim(left=100)
-    ax.set_ylim(bottom=100)
+    # Auto-fit limits to the data with a ~20% margin on the log axis.
+    ax.set_xlim(left=lo, right=hi)
+    ax.set_ylim(bottom=lo, top=hi)
     ax.set_xlabel("Observed Volumes [veh/h]", fontsize=11)
     ax.set_ylabel("Simulated Volumes [veh/h]", fontsize=11)
     ax.set_title(title, fontsize=11)
@@ -185,17 +273,27 @@ def _new_fig():
     return fig, ax
 
 
-def generate_overlay(loaded: dict[str, Path], hours: list[int], sum_directions: bool):
-    """One figure per hour; every experiment overlaid on shared axes."""
+def generate_overlay(loaded: dict[str, Path], hours: list[int], sum_directions: bool,
+                     connect: bool = False):
+    """One figure per hour; every experiment overlaid on shared axes.
+
+    When *connect* is set, the same station's points are joined across
+    experiments so you can see whether a station moved toward or away from the
+    1:1 line. Stations are matched by their full Count Station Id (the
+    station_base when --sum-directions collapses directions).
+    """
     for hour in hours:
         fig, ax = _new_fig()
         all_obs, all_sim = [], []
+        coords_by_exp = []
         plotted = 0
         for i, (label, counts_file) in enumerate(loaded.items()):
             plot_df = load_hour(counts_file, hour, sum_directions)
             if plot_df is None or plot_df.empty:
                 print(f"  SKIP {label} hour {hour}: no data")
                 continue
+            # Connectors are drawn first (lower zorder) so markers sit on top.
+            coords_by_exp.append(_plot_coords(plot_df))
             _scatter(ax, plot_df, _PALETTE[i % len(_PALETTE)],
                      _MARKERS[i % len(_MARKERS)], label)
             all_obs.append(plot_df["obs"].values)
@@ -206,11 +304,21 @@ def generate_overlay(loaded: dict[str, Path], hours: list[int], sum_directions: 
             plt.close(fig)
             continue
 
+        if connect:
+            if plotted < 2:
+                print(f"  hour {hour}: --connect needs >=2 experiments with data; "
+                      f"only {plotted} present, drawing points only")
+            else:
+                n = _draw_connectors(ax, coords_by_exp)
+                print(f"  hour {hour}: connected {n} station(s) across experiments")
+
         agg = "summed" if sum_directions else "per-dir"
         _finalize_axes(ax, np.concatenate(all_obs), np.concatenate(all_sim),
                        f"Counts comparison — hour {hour:02d}:00 ({agg})")
         FIGURES_DIR.mkdir(parents=True, exist_ok=True)
         suffix = "summed" if sum_directions else "perdir"
+        if connect:
+            suffix += "_connected"
         out_path = FIGURES_DIR / f"counts_overlay_h{hour:02d}_{suffix}.pdf"
         fig.savefig(out_path, bbox_inches="tight", dpi=150)
         plt.close(fig)
@@ -280,7 +388,17 @@ def main():
         help="Sum per-direction stations into one point per physical sensor. "
              "Default: plot each direction separately.",
     )
+    parser.add_argument(
+        "--connect", action="store_true",
+        help="Overlay mode only: join the same station's points across "
+             "experiments with a line (green=moved toward 1:1, red=away) so you "
+             "can see per-station improvement. Matches on full station id.",
+    )
     args = parser.parse_args()
+
+    if args.connect and args.mode != "overlay":
+        print("  NOTE: --connect only applies to --mode overlay; ignoring it.")
+        args.connect = False
 
     print(f"Experiments root: {EXPERIMENTS_DIR}")
     loaded = resolve_experiments()
@@ -292,7 +410,7 @@ def main():
     print(f"\nMode: {args.mode} | hours: {args.hours} | stations: {agg}\n")
 
     if args.mode == "overlay":
-        generate_overlay(loaded, args.hours, args.sum_directions)
+        generate_overlay(loaded, args.hours, args.sum_directions, connect=args.connect)
     else:
         generate_separate(loaded, args.hours, args.sum_directions)
 
